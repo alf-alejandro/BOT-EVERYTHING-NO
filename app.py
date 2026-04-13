@@ -7,12 +7,13 @@ import os
 import threading
 import time
 import logging
-from flask import Flask, jsonify, render_template
+from pathlib import Path
+from flask import Flask, jsonify
 
 # Importar lógica del bot
 from bot import (
     run_cycle, load_state, save_state, init_csv,
-    NO_MIN_THRESHOLD, FIXED_ENTRY_USD,
+    NO_MIN_THRESHOLD, FIXED_ENTRY_USD, CSV_FILE,
 )
 
 logging.basicConfig(
@@ -71,10 +72,9 @@ def build_snapshot(state):
         })
 
     # Últimas 50 filas del CSV
-    csv_path = Path("simulation_results.csv")
     history = []
-    if csv_path.exists():
-        with open(csv_path, newline="", encoding="utf-8") as f:
+    if CSV_FILE.exists():
+        with open(CSV_FILE, newline="", encoding="utf-8") as f:
             rows = list(csv_module.DictReader(f))
             for r in reversed(rows[-50:]):
                 history.append({
@@ -118,7 +118,18 @@ def build_snapshot(state):
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    # HTML inline — sin dependencia de carpeta templates
+    html_path = Path(__file__).parent / "templates" / "index.html"
+    if html_path.exists():
+        return html_path.read_text(encoding="utf-8"), 200, {"Content-Type": "text/html"}
+    # Fallback mínimo si tampoco existe el archivo
+    return """<!DOCTYPE html><html><head><title>POLYBOT</title>
+    <meta http-equiv="refresh" content="5">
+    <style>body{background:#090c10;color:#39d353;font-family:monospace;padding:40px}</style>
+    </head><body>
+    <h2>POLYBOT — cargando...</h2>
+    <p>Accede a <a href="/api/state" style="color:#58a6ff">/api/state</a> para ver datos en JSON.</p>
+    </body></html>""", 200, {"Content-Type": "text/html"}
 
 
 @app.route("/api/state")
