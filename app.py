@@ -1,5 +1,5 @@
 """
-app.py — Web server + bot runner para Railway
+app.py — Web server + bot runner para Railway (Underdog Hunter)
 Corre el bot en un thread de fondo y sirve el dashboard en el puerto $PORT
 """
 
@@ -10,10 +10,10 @@ import logging
 from pathlib import Path
 from flask import Flask, jsonify
 
-# Importar lógica del bot
+# Importar lógica del bot (Ajustado para el Underdog Hunter)
 from bot import (
     run_cycle, load_state, save_state, init_csv,
-    NO_MIN_THRESHOLD, FIXED_ENTRY_USD, CSV_FILE,
+    YES_MAX_THRESHOLD, FIXED_ENTRY_USD, CSV_FILE,
 )
 
 logging.basicConfig(
@@ -37,7 +37,7 @@ BOT_INTERVAL = int(os.environ.get("BOT_INTERVAL", 300))
 def bot_loop():
     init_csv()
     state = load_state()
-    log.info("Bot iniciado — umbral NO >%.0f%% | intervalo %ds", NO_MIN_THRESHOLD * 100, BOT_INTERVAL)
+    log.info("Bot iniciado — umbral YES <%.0f%% | intervalo %ds", YES_MAX_THRESHOLD * 100, BOT_INTERVAL)
 
     while True:
         try:
@@ -62,13 +62,13 @@ def build_snapshot(state):
     for cid, pos in open_pos.items():
         open_list.append({
             "question":    pos["question"],
-            "entry_no":    round(pos["entry_no"] * 100, 1),
-            "current_no":  round(pos.get("current_no", pos["entry_no"]) * 100, 1),
-            "current_yes": round(pos.get("current_yes", 1 - pos["entry_no"]) * 100, 1),
+            "entry_yes":   round(pos["entry_yes"] * 100, 1),
+            "current_no":  round(pos.get("current_no", pos.get("entry_no", 0)) * 100, 1),
+            "current_yes": round(pos.get("current_yes", pos["entry_yes"]) * 100, 1),
             "volume":      pos["volume"],
             "entry_time":  pos["entry_time"],
             "allocated":   pos["allocated"],
-            "lost_confirm": pos.get("lost_confirm_count", 0),
+            "won_confirm": pos.get("won_confirm_count", 0),
         })
 
     # Últimas 50 filas del CSV
@@ -80,8 +80,8 @@ def build_snapshot(state):
                 history.append({
                     "closed_at":   r["closed_at"],
                     "question":    r["question"],
-                    "entry_no":    round(float(r["entry_no_price"]) * 100, 1),
-                    "exit_no":     round(float(r["exit_no_price"]) * 100, 1),
+                    "entry_yes":   round(float(r["entry_yes_price"]) * 100, 1),
+                    "exit_yes":    round(float(r["exit_yes_price"]) * 100, 1),
                     "pnl":         float(r["pnl_usd"]),
                     "result":      r["result"],
                     "duration":    r["duration_min"],
@@ -105,7 +105,7 @@ def build_snapshot(state):
         "open_positions": open_list,
         "history":        history,
         "config": {
-            "threshold": NO_MIN_THRESHOLD * 100,
+            "threshold": YES_MAX_THRESHOLD * 100,
             "entry_usd": FIXED_ENTRY_USD,
             "interval":  BOT_INTERVAL,
         },
@@ -118,7 +118,7 @@ DASHBOARD_HTML = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>POLYBOT — Nothing Ever Happens</title>
+<title>POLYBOT — Underdog Hunter</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
 <style>
@@ -319,12 +319,13 @@ DASHBOARD_HTML = """
   .pos-no {
     text-align: right;
     font-size: 12px;
-    color: var(--green);
+    color: var(--dim); /* Ahora el NO está atenuado */
   }
   .pos-yes {
     text-align: right;
     font-size: 12px;
-    color: var(--dim);
+    color: var(--green); /* YES es el foco principal */
+    font-weight: bold;
   }
   .pos-vol {
     text-align: right;
@@ -332,8 +333,8 @@ DASHBOARD_HTML = """
     color: var(--dim);
   }
 
-  .warning-row { background: rgba(227, 179, 65, 0.05) !important; }
-  .warning-row .pos-yes { color: var(--yellow); font-weight: bold; }
+  .warning-row { background: rgba(57, 211, 83, 0.1) !important; } /* Verde si hay posible gol */
+  .warning-row .pos-yes { color: #fff; font-weight: bold; }
 
   .col-header {
     display: grid;
@@ -391,7 +392,7 @@ DASHBOARD_HTML = """
   }
   .hist-pnl.pos { color: var(--green); }
   .hist-pnl.neg { color: var(--red); }
-  .hist-no { text-align: right; font-size: 11px; color: var(--dim); }
+  .hist-no { text-align: right; font-size: 11px; color: var(--green); } /* Ahora muestra YES entry */
   .hist-dur { text-align: right; font-size: 11px; color: var(--dim); }
 
   .hist-col-header {
@@ -469,7 +470,7 @@ DASHBOARD_HTML = """
 <header>
   <div>
     <div class="logo">POLY<span>BOT</span></div>
-    <div class="tagline">Nothing Ever Happens Simulator</div>
+    <div class="tagline">Underdog Hunter Simulator (Fútbol)</div>
   </div>
   <div style="display:flex;align-items:center;gap:20px;">
     <span class="last-update" id="last-update">—</span>
@@ -482,7 +483,6 @@ DASHBOARD_HTML = """
 
 <div class="main">
 
-  <!-- Stat cards -->
   <div class="stat-card green" style="animation-delay:0.05s">
     <div class="stat-label">PnL Total</div>
     <div class="stat-value" id="s-pnl">—</div>
@@ -507,7 +507,6 @@ DASHBOARD_HTML = """
     <div class="stat-sub" id="s-expired">Expired: —</div>
   </div>
 
-  <!-- PnL chart -->
   <div class="panel chart-panel" style="animation-delay:0.25s">
     <div class="panel-header">
       <span class="panel-title">PnL Acumulado</span>
@@ -516,14 +515,13 @@ DASHBOARD_HTML = """
     <canvas id="pnl-chart"></canvas>
   </div>
 
-  <!-- Open positions -->
   <div class="panel open-panel" style="animation-delay:0.3s">
     <div class="panel-header">
       <span class="panel-title">Posiciones Abiertas</span>
       <span class="panel-count" id="open-count">0</span>
     </div>
     <div class="col-header">
-      <span>Mercado</span>
+      <span>Mercado (Fútbol)</span>
       <span>NO%</span>
       <span>YES%</span>
       <span>Vol</span>
@@ -531,7 +529,6 @@ DASHBOARD_HTML = """
     <div id="open-list"><div class="empty">Cargando...</div></div>
   </div>
 
-  <!-- History -->
   <div class="panel history-panel" style="animation-delay:0.35s">
     <div class="panel-header">
       <span class="panel-title">Historial Reciente</span>
@@ -540,17 +537,16 @@ DASHBOARD_HTML = """
     <div class="hist-col-header">
       <span>Estado</span>
       <span>Mercado</span>
-      <span>NO entry</span>
+      <span>YES entry</span>
       <span>Duración</span>
       <span>PnL</span>
     </div>
     <div id="hist-list"><div class="empty">Cargando...</div></div>
   </div>
 
-  <!-- Config -->
   <div class="config-bar" style="animation-delay:0.4s">
     <div class="config-item">
-      <span class="config-label">Umbral NO</span>
+      <span class="config-label">Umbral YES</span>
       <span class="config-val" id="cfg-threshold">—</span>
     </div>
     <div class="config-item">
@@ -582,12 +578,6 @@ function fmtVol(v) {
   return '$' + v.toFixed(0);
 }
 
-function fmtTime(iso) {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  return d.toLocaleTimeString('es-CL', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
-}
-
 function drawChart(history) {
   const canvas = document.getElementById('pnl-chart');
   const ctx = canvas.getContext('2d');
@@ -596,11 +586,10 @@ function drawChart(history) {
   canvas.width = W;
   canvas.height = H;
 
-  // Build cumulative PnL array from history (already reversed, un-reverse)
+  // Build cumulative PnL array from history
   const pts = [...history].reverse().map(h => h.pnl);
   if (pts.length === 0) return;
 
-  // Cumulative
   const cum = [];
   let acc = 0;
   for (const p of pts) { acc += p; cum.push(acc); }
@@ -686,7 +675,7 @@ async function refresh() {
     document.getElementById('s-expired').textContent = 'Expired: ' + s.expired;
 
     // Config
-    document.getElementById('cfg-threshold').textContent = '>' + cfg.threshold + '%';
+    document.getElementById('cfg-threshold').textContent = '<' + cfg.threshold + '%';
     document.getElementById('cfg-entry').textContent = '$' + cfg.entry_usd + ' / op';
     document.getElementById('cfg-interval').textContent = cfg.interval + 's';
 
@@ -694,10 +683,10 @@ async function refresh() {
     const openList = document.getElementById('open-list');
     document.getElementById('open-count').textContent = d.open_positions.length;
     if (d.open_positions.length === 0) {
-      openList.innerHTML = '<div class="empty">Sin posiciones abiertas</div>';
+      openList.innerHTML = '<div class="empty">Buscando oportunidades en fútbol...</div>';
     } else {
       openList.innerHTML = d.open_positions.map(p => {
-        const warn = p.current_yes > 50;
+        const warn = p.current_yes > 80; // Si el YES sube a más de 80%, posible gol
         return `<div class="pos-row ${warn ? 'warning-row' : ''}">
           <div class="pos-question" title="${p.question}">${p.question}</div>
           <div class="pos-no">${p.current_no}%</div>
@@ -718,7 +707,7 @@ async function refresh() {
         return `<div class="hist-row">
           <span><span class="badge ${h.result}">${h.result.slice(0,3)}</span></span>
           <span class="hist-q" title="${h.question}">${h.question}</span>
-          <span class="hist-no">${h.entry_no}%</span>
+          <span class="hist-no">${h.entry_yes}%</span>
           <span class="hist-dur">${parseFloat(h.duration).toFixed(0)}m</span>
           <span class="hist-pnl ${pnlCls}">${fmt(h.pnl)}</span>
         </div>`;
@@ -748,9 +737,7 @@ window.addEventListener('resize', () => {
 </script>
 </body>
 </html>
-
 """
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Routes
@@ -760,32 +747,26 @@ window.addEventListener('resize', () => {
 def index():
     return DASHBOARD_HTML, 200, {"Content-Type": "text/html"}
 
-
 @app.route("/api/state")
 def api_state():
     with shared_state["lock"]:
         data = shared_state["data"]
     if data is None:
-        # Primera vez antes de que corra el bot
         state = load_state()
         data = build_snapshot(state)
     return jsonify(data)
 
-
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Arrancar bot en thread de fondo
     t = threading.Thread(target=bot_loop, daemon=True)
     t.start()
-
     port = int(os.environ.get("PORT", 8080))
     log.info("Dashboard en http://0.0.0.0:%d", port)
     app.run(host="0.0.0.0", port=port, debug=False)
