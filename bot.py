@@ -1,20 +1,16 @@
 """
-bot.py — Polymarket "Nothing Ever Happens" Simulator
+bot.py — Polymarket "Underdog Hunter" Simulator
 
-Lógica:
-  1. Escanea mercados YES/NO que expiran HOY via Gamma API
-  2. Filtra: NO > 86% (= YES < 14%) → evento muy improbable
-  3. Simula entrada de $1 a NO en cada candidato
-  4. Verifica resolución:
-       - Primero consulta Gamma por resolución FORMAL (campo resolved + resolutionPrice)
-       - Si no hay resolución formal, lee CLOB para precio actual
-       - NO >= 0.99 → WON, YES >= 0.99 → LOST (con confirmación anti-flasheazo)
-  5. Guarda cada posición cerrada en simulation_results.csv
-
-FIX: El bot anterior nunca detectaba WON/LOST porque:
-  - parse_prices() filtraba precios fuera de 0.01-0.99, descartando mercados resueltos
-  - El CLOB queda vacío cuando el mercado resuelve, devolviendo ask=None
-  - La solución: consultar Gamma directamente por "resolved" antes de leer el CLOB
+Lógica (Estrategia Inversa / Francotirador):
+  1. Escanea mercados que expiran HOY via Gamma API.
+  2. Filtra SOLO partidos de fútbol (por palabras clave: FC, Draw, O/U, etc.).
+  3. Filtra YES barato: YES > 0.01 y YES <= 0.12 (El Underdog).
+  4. Simula entrada de $1 a YES.
+  5. Verifica resolución:
+        - Gamma FORMAL: resolutionPrice = 1.0 (WON), resolutionPrice = 0.0 (LOST).
+        - CLOB: YES >= 0.99 → WON (con confirmación anti-flasheazo por VAR/goles anulados).
+        - CLOB: NO >= 0.99 → LOST.
+  6. Guarda cada posición cerrada en simulation_results_underdog.csv
 """
 
 import csv
@@ -40,18 +36,31 @@ CLOB_BASE  = "https://clob.polymarket.com"
 
 DATA_DIR   = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-CSV_FILE   = DATA_DIR / "simulation_results.csv"
-STATE_FILE = DATA_DIR / "simulation_state.json"
+# [NUEVO] Archivos separados para no sobreescribir tu base de datos anterior
+CSV_FILE   = DATA_DIR / "simulation_results_underdog.csv"
+STATE_FILE = DATA_DIR / "simulation_state_underdog.json"
 
-NO_MIN_THRESHOLD  = 0.86   # NO price mínimo para entrar
-NO_MAX_THRESHOLD  = 0.985  # NO price máximo — por encima ya está resuelto o sin liquidez real
-MIN_VOLUME_USD    = 500    # volumen mínimo para que el mercado tenga sentido
-FIXED_ENTRY_USD   = 1.00   # monto fijo por posición simulada
-MAX_POSITIONS     = 50     # máximo de posiciones abiertas simultáneas
+# [NUEVO] Umbrales para comprar YES
+YES_MAX_THRESHOLD = 0.12   # Precio máximo que pagaremos por el YES (12%)
+YES_MIN_THRESHOLD = 0.015  # Precio mínimo (evitamos mercados muertos al 1%)
+MIN_VOLUME_USD    = 500    # Volumen mínimo
+FIXED_ENTRY_USD   = 1.00   # Monto fijo simulado
+MAX_POSITIONS     = 50     # Máximo de posiciones
 
-# Confirmación de LOST — evita flasheazos del oráculo
-LOST_CONFIRM_CHECKS  = 4   # cuántas veces debe verse YES≥0.99 antes de confirmar LOST
-LOST_CONFIRM_DELAY_S = 8   # segundos entre cada re-verificación
+# [NUEVO] Palabras clave para detectar Fútbol
+SOCCER_KEYWORDS = [
+    " fc ", " sc ", " afc ", " cd ", " cs ", " ca ", " fbpa ",  # Siglas comunes de clubes
+    "end in a draw", 
+    "o/u", 
+    "spread:", 
+    "exact score", 
+    "both teams to score", 
+    " vs. " # Polymarket usa siempre " vs. " para enfrentar equipos (Ej: Grêmio FBPA vs. CD Riestra)
+]
+
+# Confirmación de WON (antes era para LOST) — evita flasheazos del oráculo por el VAR
+WON_CONFIRM_CHECKS   = 4   
+WON_CONFIRM_DELAY_S  = 8   
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -75,11 +84,6 @@ def _get(url, params=None, timeout=(5, 10)):
 
 
 def parse_prices(m):
-    """
-    Lee los precios YES/NO de un mercado Gamma.
-    SOLO filtra precios inválidos (None, negativos).
-    NO filtra extremos (0.0 o 1.0) — esos son mercados resueltos válidos.
-    """
     raw = m.get("outcomePrices") or "[]"
     try:
         prices = json.loads(raw) if isinstance(raw, str) else raw
@@ -91,7 +95,6 @@ def parse_prices(m):
 
 
 def fetch_yes_clob(yes_token_id):
-    """Devuelve (ask, bid) del CLOB para YES token. Puede devolver None si el libro está vacío."""
     if not yes_token_id:
         return None, None
     data = _get(f"{CLOB_BASE}/book", params={"token_id": yes_token_id}, timeout=(3, 5))
@@ -106,24 +109,11 @@ def fetch_yes_clob(yes_token_id):
 
 def check_resolution_gamma(cid):
     """
-    Consulta Gamma directamente para ver si el mercado ya resolvió formalmente.
-
     Gamma devuelve:
-      - resolved: true/false
-      - resolutionPrice: 1.0 = YES ganó (evento ocurrió), 0.0 = NO ganó (nada pasó)
-
-    Retorna: 'WON', 'LOST', o None (aún no resuelto)
-
-    Por qué esto es necesario:
-      Cuando el mercado resuelve, el CLOB se vacía (no hay más órdenes).
-      fetch_yes_clob() devuelve ask=None, y el bot se queda con el precio viejo.
-      Gamma en cambio actualiza `resolved` y `resolutionPrice` apenas cierra.
+      - resolutionPrice: 1.0 = YES ganó, 0.0 = NO ganó
     """
     data = _get(f"{GAMMA_BASE}/markets/{cid}")
-    if not data:
-        return None
-
-    if not data.get("resolved"):
+    if not data or not data.get("resolved"):
         return None
 
     res_price = data.get("resolutionPrice")
@@ -132,26 +122,22 @@ def check_resolution_gamma(cid):
 
     res_price = float(res_price)
 
-    # resolutionPrice = 0.0 → NO ganó → nosotros ganamos (compramos NO)
-    if res_price <= 0.01:
+    # [NUEVO] resolutionPrice = 1.0 → YES ganó → nosotros ganamos
+    if res_price >= 0.99:
         return "WON"
 
-    # resolutionPrice = 1.0 → YES ganó → evento ocurrió → perdimos
-    if res_price >= 0.99:
+    # [NUEVO] resolutionPrice = 0.0 → NO ganó → evento NO ocurrió → perdimos
+    if res_price <= 0.01:
         return "LOST"
 
     return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Gamma scanner — mercados que expiran hoy con NO > 86%
+# Gamma scanner — mercados YES baratos
 # ──────────────────────────────────────────────────────────────────────────────
 
 def scan_todays_markets():
-    """
-    Devuelve lista de dicts con info de mercados candidatos.
-    Solo filtra por rango de NO útil (86%–98.5%) para nuevas entradas.
-    """
     today    = now_utc().date()
     tomorrow = today + timedelta(days=1)
 
@@ -182,6 +168,14 @@ def scan_todays_markets():
                 continue
             seen.add(cid)
 
+            question = m.get("question", "")
+            q_lower = question.lower()
+            
+            # [NUEVO] 1. Filtrar solo fútbol
+            is_soccer = any(kw in q_lower for kw in SOCCER_KEYWORDS)
+            if not is_soccer:
+                continue
+
             outcomes = m.get("outcomes")
             if isinstance(outcomes, str):
                 try:
@@ -195,8 +189,8 @@ def scan_todays_markets():
             if yes_price is None or no_price is None:
                 continue
 
-            # Para NUEVAS entradas: solo rango útil (excluye ya resueltos)
-            if no_price < NO_MIN_THRESHOLD or no_price > NO_MAX_THRESHOLD:
+            # [NUEVO] 2. Filtrar YES barato (Underdog)
+            if yes_price < YES_MIN_THRESHOLD or yes_price > YES_MAX_THRESHOLD:
                 continue
 
             volume = float(m.get("volume") or 0)
@@ -216,7 +210,7 @@ def scan_todays_markets():
 
             candidates.append({
                 "condition_id":  cid,
-                "question":      m.get("question", ""),
+                "question":      question,
                 "slug":          m.get("slug", ""),
                 "yes_price":     round(yes_price, 4),
                 "no_price":      round(no_price, 4),
@@ -230,10 +224,11 @@ def scan_todays_markets():
             break
         params["offset"] += params["limit"]
 
-    candidates.sort(key=lambda x: x["no_price"], reverse=True)
+    # Ordenamos por los YES más baratos primero
+    candidates.sort(key=lambda x: x["yes_price"])
     log.info(
-        "Scan: %d mercados | NO %.0f%%–%.0f%% | vol≥$%d",
-        len(candidates), NO_MIN_THRESHOLD * 100, NO_MAX_THRESHOLD * 100, MIN_VOLUME_USD,
+        "Scan: %d partidos de fútbol | YES %.1f%%–%.1f%% | vol≥$%d",
+        len(candidates), YES_MIN_THRESHOLD * 100, YES_MAX_THRESHOLD * 100, MIN_VOLUME_USD,
     )
     return candidates
 
@@ -262,13 +257,13 @@ def save_state(state):
 # CSV
 # ──────────────────────────────────────────────────────────────────────────────
 
+# [NUEVO] Cambiado headers para registrar la entrada de YES
 CSV_HEADERS = [
     "closed_at", "condition_id", "question",
-    "entry_no_price", "exit_no_price",
+    "entry_yes_price", "exit_yes_price",
     "allocated_usd", "pnl_usd", "result",
     "volume_at_entry", "end_date", "duration_min",
 ]
-
 
 def init_csv():
     if not CSV_FILE.exists():
@@ -281,8 +276,7 @@ def append_csv(row):
         csv.DictWriter(f, fieldnames=CSV_HEADERS).writerow(row)
 
 
-def close_position(cid, pos, result, exit_no, pnl, state, now):
-    """Helper que registra CSV, actualiza stats y marca para borrar."""
+def close_position(cid, pos, result, exit_yes, pnl, state, now):
     entry_time   = datetime.fromisoformat(pos["entry_time"])
     duration_min = round((now - entry_time).total_seconds() / 60, 1)
 
@@ -290,8 +284,8 @@ def close_position(cid, pos, result, exit_no, pnl, state, now):
         "closed_at":       now.isoformat(),
         "condition_id":    cid,
         "question":        pos["question"],
-        "entry_no_price":  pos["entry_no"],
-        "exit_no_price":   exit_no,
+        "entry_yes_price": pos["entry_yes"], # [NUEVO]
+        "exit_yes_price":  exit_yes,         # [NUEVO]
         "allocated_usd":   pos["allocated"],
         "pnl_usd":         pnl,
         "result":          result,
@@ -310,10 +304,10 @@ def close_position(cid, pos, result, exit_no, pnl, state, now):
 
     state["stats"]["pnl"] = round(state["stats"]["pnl"] + pnl, 4)
 
-    emoji = "✅" if result == "WON" else ("❌" if result == "LOST" else "⏳")
+    emoji = "🔥" if result == "WON" else ("💀" if result == "LOST" else "⏳")
     log.info(
-        "%s %s | exit_NO=%.1f%% PnL=$%+.2f | %s",
-        emoji, result, exit_no * 100, pnl, pos["question"][:55],
+        "%s %s | exit_YES=%.1f%% PnL=$%+.2f | %s",
+        emoji, result, exit_yes * 100, pnl, pos["question"][:55],
     )
 
 
@@ -335,7 +329,8 @@ def run_cycle(state):
             if len(open_pos) >= MAX_POSITIONS:
                 break
 
-            tokens_no = round(FIXED_ENTRY_USD / c["no_price"], 6)
+            # [NUEVO] Compramos tokens YES
+            tokens_yes = round(FIXED_ENTRY_USD / c["yes_price"], 6)
 
             open_pos[c["condition_id"]] = {
                 "question":           c["question"],
@@ -344,23 +339,23 @@ def run_cycle(state):
                 "entry_yes":          c["yes_price"],
                 "current_no":         c["no_price"],
                 "current_yes":        c["yes_price"],
-                "tokens_no":          tokens_no,
+                "tokens_yes":         tokens_yes,  # [NUEVO]
                 "allocated":          FIXED_ENTRY_USD,
                 "volume":             c["volume"],
                 "end_date":           c["end_date"],
                 "yes_token_id":       c["yes_token_id"],
                 "no_token_id":        c["no_token_id"],
                 "entry_time":         now.isoformat(),
-                "lost_confirm_count": 0,
+                "won_confirm_count":  0,           # [NUEVO]
             }
             new_entries += 1
             log.info(
-                "ENTRY  NO=%.1f%% vol=$%.0f | %s",
-                c["no_price"] * 100, c["volume"], c["question"][:60],
+                "ENTRY  YES=%.1f%% (NO=%.1f%%) | vol=$%.0f | %s",
+                c["yes_price"] * 100, c["no_price"] * 100, c["volume"], c["question"][:60],
             )
 
         if new_entries:
-            log.info("Abiertas %d nuevas posiciones. Total open: %d", new_entries, len(open_pos))
+            log.info("Abiertas %d nuevas posiciones (Underdogs). Total open: %d", new_entries, len(open_pos))
     else:
         log.info("MAX_POSITIONS alcanzado (%d). Solo monitoreando.", MAX_POSITIONS)
 
@@ -369,34 +364,28 @@ def run_cycle(state):
 
     for cid, pos in list(open_pos.items()):
 
-        # ── PASO A: Chequear resolución formal en Gamma ──────────────────────
-        #
-        # Este es el fix principal. Gamma marca `resolved=true` y pone
-        # `resolutionPrice` cuando el mercado cierra formalmente.
-        # El CLOB en cambio queda vacío → fetch_yes_clob() devuelve None.
-        # Sin este chequeo el bot nunca detecta que el mercado terminó.
-        #
         formal = check_resolution_gamma(cid)
 
+        # [NUEVO] Si Gamma dice YES (1.0), ganamos
         if formal == "WON":
-            exit_no = 1.00
-            pnl     = round(pos["tokens_no"] * 1.0 - pos["allocated"], 4)
-            close_position(cid, pos, "WON", exit_no, pnl, state, now)
+            exit_yes = 1.00
+            pnl      = round(pos["tokens_yes"] * 1.0 - pos["allocated"], 4)
+            close_position(cid, pos, "WON", exit_yes, pnl, state, now)
             closed_ids.append(cid)
             continue
 
+        # [NUEVO] Si Gamma dice NO (0.0), perdimos
         if formal == "LOST":
-            exit_no = 0.00
-            pnl     = round(-pos["allocated"], 4)
-            close_position(cid, pos, "LOST", exit_no, pnl, state, now)
+            exit_yes = 0.00
+            pnl      = round(-pos["allocated"], 4)
+            close_position(cid, pos, "LOST", exit_yes, pnl, state, now)
             closed_ids.append(cid)
             continue
 
-        # ── PASO B: Si no resolvió formalmente, leer precio del CLOB ─────────
+        # ── PASO B: CLOB ─────────
         yes_tid    = pos.get("yes_token_id")
         ask, bid   = fetch_yes_clob(yes_tid) if yes_tid else (None, None)
 
-        # Si el CLOB devolvió un precio válido, actualizarlo; si no, mantener el último
         if ask is not None:
             current_yes = ask
             current_no  = round(1 - ask, 4)
@@ -406,24 +395,20 @@ def run_cycle(state):
             current_yes = pos["current_yes"]
             current_no  = pos["current_no"]
 
-        result  = None
-        exit_no = current_no
-        pnl     = 0.0
+        result   = None
+        exit_yes = current_yes
+        pnl      = 0.0
 
-        # ── PASO C: Anti-flasheazo para LOST vía CLOB ─────────────────────────
-        #
-        # A veces el oráculo de Polymarket sube YES a 0.99+ por un momento
-        # antes de confirmar. Requerimos LOST_CONFIRM_CHECKS lecturas seguidas.
-        #
+        # ── PASO C: Anti-flasheazo para WON vía CLOB (Posible Gol/VAR) ───────────
         if current_yes >= 0.99:
-            pos["lost_confirm_count"] = pos.get("lost_confirm_count", 0) + 1
-            if pos["lost_confirm_count"] < LOST_CONFIRM_CHECKS:
+            pos["won_confirm_count"] = pos.get("won_confirm_count", 0) + 1
+            if pos["won_confirm_count"] < WON_CONFIRM_CHECKS:
                 log.info(
-                    "⚠️  LOST candidato (%d/%d) — re-verificando en %ds | %s",
-                    pos["lost_confirm_count"], LOST_CONFIRM_CHECKS,
-                    LOST_CONFIRM_DELAY_S, pos["question"][:55],
+                    "⚠️  GOLAZO/WON candidato (%d/%d) — esperando VAR/confirmación en %ds | %s",
+                    pos["won_confirm_count"], WON_CONFIRM_CHECKS,
+                    WON_CONFIRM_DELAY_S, pos["question"][:55],
                 )
-                time.sleep(LOST_CONFIRM_DELAY_S)
+                time.sleep(WON_CONFIRM_DELAY_S)
                 ask2, _ = fetch_yes_clob(yes_tid) if yes_tid else (None, None)
                 if ask2 is not None:
                     current_yes = ask2
@@ -432,42 +417,41 @@ def run_cycle(state):
                     pos["current_no"]  = current_no
                 if current_yes < 0.99:
                     log.info(
-                        "✅ Flasheazo descartado — YES volvió a %.1f%% | %s",
+                        "❌ Falsa alarma / VAR anulado — YES bajó a %.1f%% | %s",
                         current_yes * 100, pos["question"][:55],
                     )
-                    pos["lost_confirm_count"] = 0
+                    pos["won_confirm_count"] = 0
             else:
-                result  = "LOST"
-                exit_no = 0.00
-                pnl     = round(-pos["allocated"], 4)
+                result   = "WON"
+                exit_yes = 1.00
+                pnl      = round(pos["tokens_yes"] * 1.0 - pos["allocated"], 4)
         else:
-            pos["lost_confirm_count"] = 0
+            pos["won_confirm_count"] = 0
 
-        # ── PASO D: WON vía CLOB (NO llegó a 0.99+ sin resolución formal) ────
+        # ── PASO D: LOST vía CLOB (NO llegó a 0.99+, evento descartado) ────
         if result is None and current_no >= 0.99:
-            result  = "WON"
-            exit_no = 1.00
-            pnl     = round(pos["tokens_no"] * 1.0 - pos["allocated"], 4)
+            result   = "LOST"
+            exit_yes = 0.00
+            pnl      = round(-pos["allocated"], 4)
 
-        # ── PASO E: EXPIRED — pasaron 24h desde end_date sin resolución ───────
+        # ── PASO E: EXPIRED ───────
         if result is None and pos.get("end_date"):
             try:
                 end_dt = datetime.fromisoformat(pos["end_date"])
                 if now > end_dt + timedelta(hours=24):
-                    result  = "EXPIRED_UNRESOLVED"
-                    exit_no = current_no
-                    pnl     = round(pos["tokens_no"] * exit_no - pos["allocated"], 4)
+                    result   = "EXPIRED_UNRESOLVED"
+                    exit_yes = current_yes
+                    pnl      = round(pos["tokens_yes"] * exit_yes - pos["allocated"], 4)
             except Exception:
                 pass
 
         if result:
-            close_position(cid, pos, result, exit_no, pnl, state, now)
+            close_position(cid, pos, result, exit_yes, pnl, state, now)
             closed_ids.append(cid)
 
     for cid in closed_ids:
         open_pos.pop(cid, None)
 
-    # ── 3. Resumen ────────────────────────────────────────────────────────────
     s = state["stats"]
     log.info(
         "── Stats: total=%d won=%d lost=%d expired=%d PnL=$%+.4f | Open=%d ──",
@@ -502,11 +486,11 @@ def print_report():
     win_rt   = won / (won + lost) * 100 if (won + lost) > 0 else 0
 
     print(f"\n{'='*60}")
-    print(f"  REPORTE — Nothing Ever Happens Simulator")
+    print(f"  REPORTE — Underdog Hunter (Football)")
     print(f"{'='*60}")
     print(f"  Total cerradas            : {total}")
-    print(f"  WON                       : {won}  ({win_rt:.1f}% vs LOST)")
-    print(f"  LOST                      : {lost}")
+    print(f"  WON (Underdog hit)        : {won}  ({win_rt:.1f}% hit rate)")
+    print(f"  LOST (Favorito ganó)      : {lost}")
     print(f"  EXPIRED sin resolver      : {expired}")
     print(f"  ─────────────────────────────────────────")
     print(f"  PnL WON                   : ${won_pnl:+.4f}")
@@ -515,26 +499,22 @@ def print_report():
     print(f"  Capital simulado          : ${inv:.2f}")
     print(f"  ROI                       : {pnl/inv*100:+.2f}%" if inv > 0 else "  ROI: n/a")
     print(f"{'='*60}")
-    print(f"  Nota: WON paga $1/token → PnL = $1/entry_no - $1")
-    print(f"        Ej: entry NO=87.5% → paga $1/0.875=$1.143 → +$0.143")
+    print(f"  Nota: WON paga $1/token → PnL = $1/entry_yes - $1")
+    print(f"        Ej: entry YES=4% ($0.04) → paga $1/0.04=$25.00 → +$24.00")
     print(f"{'='*60}\n")
 
-    print(f"{'Resultado':<8} {'NO entry':>9} {'NO exit':>8} {'PnL':>7}  Pregunta")
+    print(f"{'Resultado':<8} {'YES entry':>9} {'YES exit':>8} {'PnL':>7}  Pregunta")
     print("-" * 75)
     for r in rows[-20:]:
         print(
-            f"{r['result']:<8} {float(r['entry_no_price'])*100:>8.1f}%"
-            f" {float(r['exit_no_price'])*100:>7.1f}%"
+            f"{r['result']:<8} {float(r['entry_yes_price'])*100:>8.1f}%"
+            f" {float(r['exit_yes_price'])*100:>7.1f}%"
             f" ${float(r['pnl_usd']):>+6.2f}  {r['question'][:45]}"
         )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────────────────────
-
 def main():
-    parser = argparse.ArgumentParser(description="Nothing Ever Happens — Polymarket Simulator")
+    parser = argparse.ArgumentParser(description="Underdog Hunter — Football Simulator")
     parser.add_argument("--loop",     action="store_true", help="Corre en bucle continuo")
     parser.add_argument("--interval", type=int, default=300, help="Segundos entre ciclos (default: 300)")
     parser.add_argument("--report",   action="store_true", help="Solo muestra reporte CSV")
@@ -555,8 +535,8 @@ def main():
     init_csv()
     state = load_state()
 
-    log.info("Nothing Ever Happens Simulator — inicio")
-    log.info("Umbral NO: >%.0f%%  |  Entrada fija: $%.2f", NO_MIN_THRESHOLD * 100, FIXED_ENTRY_USD)
+    log.info("Underdog Hunter Simulator — inicio")
+    log.info("Umbral YES: <%.0f%%  |  Entrada fija: $%.2f", YES_MAX_THRESHOLD * 100, FIXED_ENTRY_USD)
 
     if args.loop:
         log.info("Modo loop — intervalo %ds. Ctrl+C para detener.", args.interval)
