@@ -10,6 +10,8 @@ Lógica (Estrategia Inversa / Francotirador):
         - Gamma FORMAL: resolutionPrice = 1.0 (WON), resolutionPrice = 0.0 (LOST).
         - CLOB: YES >= 0.99 → WON (con confirmación anti-flasheazo por VAR/goles anulados).
         - CLOB: NO >= 0.99 → LOST.
+        - [FIX] CLOB: YES >= 0.90 y partido ya terminó (end_date pasado) → fuerza re-check Gamma
+        - [FIX] EXPIRED: reducido de 24h a 2h post end_date para no quedarse pegado.
   6. Guarda cada posición cerrada en simulation_results_underdog.csv
 """
 
@@ -36,31 +38,35 @@ CLOB_BASE  = "https://clob.polymarket.com"
 
 DATA_DIR   = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-# [NUEVO] Archivos separados para no sobreescribir tu base de datos anterior
 CSV_FILE   = DATA_DIR / "simulation_results_underdog.csv"
 STATE_FILE = DATA_DIR / "simulation_state_underdog.json"
 
-# [NUEVO] Umbrales para comprar YES
 YES_MAX_THRESHOLD = 0.12   # Precio máximo que pagaremos por el YES (12%)
 YES_MIN_THRESHOLD = 0.015  # Precio mínimo (evitamos mercados muertos al 1%)
 MIN_VOLUME_USD    = 500    # Volumen mínimo
 FIXED_ENTRY_USD   = 1.00   # Monto fijo simulado
 MAX_POSITIONS     = 50     # Máximo de posiciones
 
-# [NUEVO] Palabras clave para detectar Fútbol
+# [FIX] Tiempo de gracia post end_date antes de marcar EXPIRED (antes 24h, ahora 2h)
+EXPIRED_GRACE_HOURS = 2
+
+# [FIX] Umbral YES para forzar re-check Gamma cuando el partido ya terminó
+# Cubre el caso donde Spread resuelve a YES >= 0.90 pero no llega a 0.99 en CLOB
+POST_MATCH_YES_THRESHOLD = 0.90
+
 SOCCER_KEYWORDS = [
-    " fc ", " sc ", " afc ", " cd ", " cs ", " ca ", " fbpa ",  # Siglas comunes de clubes
-    "end in a draw", 
-    "o/u", 
-    "spread:", 
-    "exact score", 
-    "both teams to score", 
-    " vs. " # Polymarket usa siempre " vs. " para enfrentar equipos (Ej: Grêmio FBPA vs. CD Riestra)
+    " fc ", " sc ", " afc ", " cd ", " cs ", " ca ", " fbpa ",
+    "end in a draw",
+    "o/u",
+    "spread:",
+    "exact score",
+    "both teams to score",
+    " vs. "
 ]
 
-# Confirmación de WON (antes era para LOST) — evita flasheazos del oráculo por el VAR
-WON_CONFIRM_CHECKS   = 4   
-WON_CONFIRM_DELAY_S  = 8   
+# Confirmación de WON — evita flasheazos del oráculo por el VAR
+WON_CONFIRM_CHECKS   = 4
+WON_CONFIRM_DELAY_S  = 8
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -122,11 +128,9 @@ def check_resolution_gamma(cid):
 
     res_price = float(res_price)
 
-    # [NUEVO] resolutionPrice = 1.0 → YES ganó → nosotros ganamos
     if res_price >= 0.99:
         return "WON"
 
-    # [NUEVO] resolutionPrice = 0.0 → NO ganó → evento NO ocurrió → perdimos
     if res_price <= 0.01:
         return "LOST"
 
@@ -170,8 +174,8 @@ def scan_todays_markets():
 
             question = m.get("question", "")
             q_lower = question.lower()
-            
-            # [NUEVO] 1. Filtrar solo fútbol
+
+            # 1. Filtrar solo fútbol
             is_soccer = any(kw in q_lower for kw in SOCCER_KEYWORDS)
             if not is_soccer:
                 continue
@@ -189,7 +193,7 @@ def scan_todays_markets():
             if yes_price is None or no_price is None:
                 continue
 
-            # [NUEVO] 2. Filtrar YES barato (Underdog)
+            # 2. Filtrar YES barato (Underdog)
             if yes_price < YES_MIN_THRESHOLD or yes_price > YES_MAX_THRESHOLD:
                 continue
 
@@ -257,7 +261,6 @@ def save_state(state):
 # CSV
 # ──────────────────────────────────────────────────────────────────────────────
 
-# [NUEVO] Cambiado headers para registrar la entrada de YES
 CSV_HEADERS = [
     "closed_at", "condition_id", "question",
     "entry_yes_price", "exit_yes_price",
@@ -284,8 +287,8 @@ def close_position(cid, pos, result, exit_yes, pnl, state, now):
         "closed_at":       now.isoformat(),
         "condition_id":    cid,
         "question":        pos["question"],
-        "entry_yes_price": pos["entry_yes"], # [NUEVO]
-        "exit_yes_price":  exit_yes,         # [NUEVO]
+        "entry_yes_price": pos["entry_yes"],
+        "exit_yes_price":  exit_yes,
         "allocated_usd":   pos["allocated"],
         "pnl_usd":         pnl,
         "result":          result,
@@ -329,7 +332,6 @@ def run_cycle(state):
             if len(open_pos) >= MAX_POSITIONS:
                 break
 
-            # [NUEVO] Compramos tokens YES
             tokens_yes = round(FIXED_ENTRY_USD / c["yes_price"], 6)
 
             open_pos[c["condition_id"]] = {
@@ -339,14 +341,14 @@ def run_cycle(state):
                 "entry_yes":          c["yes_price"],
                 "current_no":         c["no_price"],
                 "current_yes":        c["yes_price"],
-                "tokens_yes":         tokens_yes,  # [NUEVO]
+                "tokens_yes":         tokens_yes,
                 "allocated":          FIXED_ENTRY_USD,
                 "volume":             c["volume"],
                 "end_date":           c["end_date"],
                 "yes_token_id":       c["yes_token_id"],
                 "no_token_id":        c["no_token_id"],
                 "entry_time":         now.isoformat(),
-                "won_confirm_count":  0,           # [NUEVO]
+                "won_confirm_count":  0,
             }
             new_entries += 1
             log.info(
@@ -364,9 +366,9 @@ def run_cycle(state):
 
     for cid, pos in list(open_pos.items()):
 
+        # ── PASO A: Gamma formal ──────────────────────────────────────────────
         formal = check_resolution_gamma(cid)
 
-        # [NUEVO] Si Gamma dice YES (1.0), ganamos
         if formal == "WON":
             exit_yes = 1.00
             pnl      = round(pos["tokens_yes"] * 1.0 - pos["allocated"], 4)
@@ -374,7 +376,6 @@ def run_cycle(state):
             closed_ids.append(cid)
             continue
 
-        # [NUEVO] Si Gamma dice NO (0.0), perdimos
         if formal == "LOST":
             exit_yes = 0.00
             pnl      = round(-pos["allocated"], 4)
@@ -382,7 +383,7 @@ def run_cycle(state):
             closed_ids.append(cid)
             continue
 
-        # ── PASO B: CLOB ─────────
+        # ── PASO B: CLOB — leer precio actual ────────────────────────────────
         yes_tid    = pos.get("yes_token_id")
         ask, bid   = fetch_yes_clob(yes_tid) if yes_tid else (None, None)
 
@@ -399,7 +400,7 @@ def run_cycle(state):
         exit_yes = current_yes
         pnl      = 0.0
 
-        # ── PASO C: Anti-flasheazo para WON vía CLOB (Posible Gol/VAR) ───────────
+        # ── PASO C: Anti-flasheazo para WON vía CLOB (VAR/goles anulados) ───
         if current_yes >= 0.99:
             pos["won_confirm_count"] = pos.get("won_confirm_count", 0) + 1
             if pos["won_confirm_count"] < WON_CONFIRM_CHECKS:
@@ -428,20 +429,55 @@ def run_cycle(state):
         else:
             pos["won_confirm_count"] = 0
 
-        # ── PASO D: LOST vía CLOB (NO llegó a 0.99+, evento descartado) ────
+        # ── PASO C2: [FIX] Mercado post-partido con YES alto pero sin llegar a 0.99 ──
+        # Cubre mercados Spread/O/U que resuelven lento en el oráculo UMA.
+        # Si el partido ya terminó y YES >= 90%, forzamos re-check Gamma agresivo.
+        if result is None and pos.get("end_date"):
+            try:
+                end_dt = datetime.fromisoformat(pos["end_date"])
+                if now > end_dt and current_yes >= POST_MATCH_YES_THRESHOLD:
+                    log.info(
+                        "🔍 [FIX] Partido terminado + YES=%.1f%% >= %.0f%% — forzando re-check Gamma | %s",
+                        current_yes * 100, POST_MATCH_YES_THRESHOLD * 100, pos["question"][:55],
+                    )
+                    formal2 = check_resolution_gamma(cid)
+                    if formal2 == "WON":
+                        result   = "WON"
+                        exit_yes = 1.00
+                        pnl      = round(pos["tokens_yes"] * 1.0 - pos["allocated"], 4)
+                    elif formal2 == "LOST":
+                        result   = "LOST"
+                        exit_yes = 0.00
+                        pnl      = round(-pos["allocated"], 4)
+                    else:
+                        # Gamma aún no resolvió — registramos en log pero dejamos seguir
+                        log.info(
+                            "⏳ [FIX] Gamma aún no resolvió mercado post-partido | YES=%.1f%% | %s",
+                            current_yes * 100, pos["question"][:55],
+                        )
+            except Exception:
+                pass
+
+        # ── PASO D: LOST vía CLOB (NO llegó a 0.99+, evento descartado) ─────
         if result is None and current_no >= 0.99:
             result   = "LOST"
             exit_yes = 0.00
             pnl      = round(-pos["allocated"], 4)
 
-        # ── PASO E: EXPIRED ───────
+        # ── PASO E: EXPIRED ───────────────────────────────────────────────────
+        # [FIX] Reducido de 24h a EXPIRED_GRACE_HOURS (2h) post end_date.
+        # Evita que mercados Spread se queden pegados indefinidamente.
         if result is None and pos.get("end_date"):
             try:
                 end_dt = datetime.fromisoformat(pos["end_date"])
-                if now > end_dt + timedelta(hours=24):
+                if now > end_dt + timedelta(hours=EXPIRED_GRACE_HOURS):
                     result   = "EXPIRED_UNRESOLVED"
                     exit_yes = current_yes
                     pnl      = round(pos["tokens_yes"] * exit_yes - pos["allocated"], 4)
+                    log.info(
+                        "⏳ [FIX] EXPIRED tras %dh de gracia | YES=%.1f%% | %s",
+                        EXPIRED_GRACE_HOURS, current_yes * 100, pos["question"][:55],
+                    )
             except Exception:
                 pass
 
