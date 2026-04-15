@@ -1,18 +1,17 @@
 """
 bot.py — Polymarket "Underdog Hunter" Simulator
 
-Lógica (Estrategia Inversa / Francotirador):
-  1. Escanea mercados que expiran HOY via Gamma API.
-  2. Filtra SOLO partidos de fútbol (por palabras clave: FC, Draw, O/U, etc.).
-  3. Filtra YES barato: YES > 0.01 y YES <= 0.12 (El Underdog).
-  4. Simula entrada de $1 a YES.
-  5. Verifica resolución:
-        - Gamma FORMAL: resolutionPrice = 1.0 (WON), resolutionPrice = 0.0 (LOST).
-        - CLOB: YES >= 0.99 → WON (con confirmación anti-flasheazo por VAR/goles anulados).
-        - CLOB: NO >= 0.99 → LOST.
-        - [FIX] CLOB: YES >= 0.90 y partido ya terminó (end_date pasado) → fuerza re-check Gamma
-        - [FIX] EXPIRED: reducido de 24h a 2h post end_date para no quedarse pegado.
-  6. Guarda cada posición cerrada en simulation_results_underdog.csv
+Lógica de resolución (simplificada, solo WON o LOST):
+  - Gamma formal resolved=true + resolutionPrice=1.0  → WON  (exit=1.0)
+  - Gamma formal resolved=true + resolutionPrice=0.0  → LOST (exit=0.0)
+  - CLOB YES >= 0.99  → WON  (con anti-flasheazo VAR)
+  - CLOB NO  >= 0.99  → LOST
+  - Partido terminado (end_date pasado) + YES >= WIN_THRESHOLD (80%) → WON
+  - Partido terminado + GRACE_HOURS sin resolver → LOST (nunca quedamos colgados)
+
+  Regla: exit siempre es 0.0 o 1.0. Sin EXPIRED.
+  PnL WON  = tokens_yes * 1.0 - allocated
+  PnL LOST = -allocated
 """
 
 import csv
@@ -47,12 +46,15 @@ MIN_VOLUME_USD    = 500    # Volumen mínimo
 FIXED_ENTRY_USD   = 1.00   # Monto fijo simulado
 MAX_POSITIONS     = 50     # Máximo de posiciones
 
-# [FIX] Tiempo de gracia post end_date antes de marcar EXPIRED (antes 24h, ahora 2h)
-EXPIRED_GRACE_HOURS = 2
+# Si el partido ya terminó y YES >= WIN_THRESHOLD → WON directo
+WIN_THRESHOLD = 0.80
 
-# [FIX] Umbral YES para forzar re-check Gamma cuando el partido ya terminó
-# Cubre el caso donde Spread resuelve a YES >= 0.90 pero no llega a 0.99 en CLOB
-POST_MATCH_YES_THRESHOLD = 0.90
+# Horas de gracia post end_date antes de forzar LOST (no hay EXPIRED)
+GRACE_HOURS = 2
+
+# Anti-flasheazo VAR: confirmaciones antes de aceptar WON vía CLOB
+WON_CONFIRM_CHECKS  = 4
+WON_CONFIRM_DELAY_S = 8
 
 SOCCER_KEYWORDS = [
     " fc ", " sc ", " afc ", " cd ", " cs ", " ca ", " fbpa ",
@@ -63,10 +65,6 @@ SOCCER_KEYWORDS = [
     "both teams to score",
     " vs. "
 ]
-
-# Confirmación de WON — evita flasheazos del oráculo por el VAR
-WON_CONFIRM_CHECKS   = 4
-WON_CONFIRM_DELAY_S  = 8
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -114,31 +112,23 @@ def fetch_yes_clob(yes_token_id):
 
 
 def check_resolution_gamma(cid):
-    """
-    Gamma devuelve:
-      - resolutionPrice: 1.0 = YES ganó, 0.0 = NO ganó
-    """
+    """Retorna 'WON', 'LOST', o None si aún no hay resolución formal."""
     data = _get(f"{GAMMA_BASE}/markets/{cid}")
     if not data or not data.get("resolved"):
         return None
-
     res_price = data.get("resolutionPrice")
     if res_price is None:
         return None
-
     res_price = float(res_price)
-
     if res_price >= 0.99:
         return "WON"
-
     if res_price <= 0.01:
         return "LOST"
-
     return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Gamma scanner — mercados YES baratos
+# Gamma scanner
 # ──────────────────────────────────────────────────────────────────────────────
 
 def scan_todays_markets():
@@ -173,11 +163,9 @@ def scan_todays_markets():
             seen.add(cid)
 
             question = m.get("question", "")
-            q_lower = question.lower()
+            q_lower  = question.lower()
 
-            # 1. Filtrar solo fútbol
-            is_soccer = any(kw in q_lower for kw in SOCCER_KEYWORDS)
-            if not is_soccer:
+            if not any(kw in q_lower for kw in SOCCER_KEYWORDS):
                 continue
 
             outcomes = m.get("outcomes")
@@ -193,7 +181,6 @@ def scan_todays_markets():
             if yes_price is None or no_price is None:
                 continue
 
-            # 2. Filtrar YES barato (Underdog)
             if yes_price < YES_MIN_THRESHOLD or yes_price > YES_MAX_THRESHOLD:
                 continue
 
@@ -228,7 +215,6 @@ def scan_todays_markets():
             break
         params["offset"] += params["limit"]
 
-    # Ordenamos por los YES más baratos primero
     candidates.sort(key=lambda x: x["yes_price"])
     log.info(
         "Scan: %d partidos de fútbol | YES %.1f%%–%.1f%% | vol≥$%d",
@@ -249,7 +235,7 @@ def load_state():
             pass
     return {
         "open_positions": {},
-        "stats": {"total": 0, "won": 0, "lost": 0, "expired": 0, "pnl": 0.0},
+        "stats": {"total": 0, "won": 0, "lost": 0, "pnl": 0.0},
     }
 
 
@@ -279,7 +265,23 @@ def append_csv(row):
         csv.DictWriter(f, fieldnames=CSV_HEADERS).writerow(row)
 
 
-def close_position(cid, pos, result, exit_yes, pnl, state, now):
+def close_position(cid, pos, result, state, now):
+    """
+    Cierra siempre como WON o LOST. exit es 1.0 o 0.0.
+    PnL WON  = tokens_yes - allocated
+    PnL LOST = -allocated
+    """
+    if result == "WON":
+        exit_yes = 1.00
+        pnl      = round(pos["tokens_yes"] * 1.0 - pos["allocated"], 4)
+        state["stats"]["won"] += 1
+        emoji = "🔥"
+    else:  # LOST
+        exit_yes = 0.00
+        pnl      = round(-pos["allocated"], 4)
+        state["stats"]["lost"] += 1
+        emoji = "💀"
+
     entry_time   = datetime.fromisoformat(pos["entry_time"])
     duration_min = round((now - entry_time).total_seconds() / 60, 1)
 
@@ -298,19 +300,12 @@ def close_position(cid, pos, result, exit_yes, pnl, state, now):
     })
 
     state["stats"]["total"] += 1
-    if result == "WON":
-        state["stats"]["won"] += 1
-    elif result == "LOST":
-        state["stats"]["lost"] += 1
-    else:
-        state["stats"]["expired"] = state["stats"].get("expired", 0) + 1
+    state["stats"]["pnl"]   = round(state["stats"]["pnl"] + pnl, 4)
 
-    state["stats"]["pnl"] = round(state["stats"]["pnl"] + pnl, 4)
-
-    emoji = "🔥" if result == "WON" else ("💀" if result == "LOST" else "⏳")
     log.info(
-        "%s %s | exit_YES=%.1f%% PnL=$%+.2f | %s",
-        emoji, result, exit_yes * 100, pnl, pos["question"][:55],
+        "%s %s | exit=%.0f%% PnL=$%+.2f | entry_YES=%.1f%% | %s",
+        emoji, result, exit_yes * 100, pnl,
+        pos["entry_yes"] * 100, pos["question"][:55],
     )
 
 
@@ -324,7 +319,7 @@ def run_cycle(state):
 
     # ── 1. Abrir nuevas posiciones ────────────────────────────────────────────
     if len(open_pos) < MAX_POSITIONS:
-        candidates = scan_todays_markets()
+        candidates  = scan_todays_markets()
         new_entries = 0
         for c in candidates:
             if c["condition_id"] in open_pos:
@@ -335,29 +330,30 @@ def run_cycle(state):
             tokens_yes = round(FIXED_ENTRY_USD / c["yes_price"], 6)
 
             open_pos[c["condition_id"]] = {
-                "question":           c["question"],
-                "slug":               c["slug"],
-                "entry_no":           c["no_price"],
-                "entry_yes":          c["yes_price"],
-                "current_no":         c["no_price"],
-                "current_yes":        c["yes_price"],
-                "tokens_yes":         tokens_yes,
-                "allocated":          FIXED_ENTRY_USD,
-                "volume":             c["volume"],
-                "end_date":           c["end_date"],
-                "yes_token_id":       c["yes_token_id"],
-                "no_token_id":        c["no_token_id"],
-                "entry_time":         now.isoformat(),
-                "won_confirm_count":  0,
+                "question":          c["question"],
+                "slug":              c["slug"],
+                "entry_no":          c["no_price"],
+                "entry_yes":         c["yes_price"],
+                "current_no":        c["no_price"],
+                "current_yes":       c["yes_price"],
+                "tokens_yes":        tokens_yes,
+                "allocated":         FIXED_ENTRY_USD,
+                "volume":            c["volume"],
+                "end_date":          c["end_date"],
+                "yes_token_id":      c["yes_token_id"],
+                "no_token_id":       c["no_token_id"],
+                "entry_time":        now.isoformat(),
+                "won_confirm_count": 0,
             }
             new_entries += 1
             log.info(
                 "ENTRY  YES=%.1f%% (NO=%.1f%%) | vol=$%.0f | %s",
-                c["yes_price"] * 100, c["no_price"] * 100, c["volume"], c["question"][:60],
+                c["yes_price"] * 100, c["no_price"] * 100,
+                c["volume"], c["question"][:60],
             )
 
         if new_entries:
-            log.info("Abiertas %d nuevas posiciones (Underdogs). Total open: %d", new_entries, len(open_pos))
+            log.info("Abiertas %d nuevas posiciones. Total open: %d", new_entries, len(open_pos))
     else:
         log.info("MAX_POSITIONS alcanzado (%d). Solo monitoreando.", MAX_POSITIONS)
 
@@ -366,26 +362,16 @@ def run_cycle(state):
 
     for cid, pos in list(open_pos.items()):
 
-        # ── PASO A: Gamma formal ──────────────────────────────────────────────
+        # ── PASO A: Gamma formal (fuente de verdad definitiva) ────────────────
         formal = check_resolution_gamma(cid)
-
-        if formal == "WON":
-            exit_yes = 1.00
-            pnl      = round(pos["tokens_yes"] * 1.0 - pos["allocated"], 4)
-            close_position(cid, pos, "WON", exit_yes, pnl, state, now)
+        if formal in ("WON", "LOST"):
+            close_position(cid, pos, formal, state, now)
             closed_ids.append(cid)
             continue
 
-        if formal == "LOST":
-            exit_yes = 0.00
-            pnl      = round(-pos["allocated"], 4)
-            close_position(cid, pos, "LOST", exit_yes, pnl, state, now)
-            closed_ids.append(cid)
-            continue
-
-        # ── PASO B: CLOB — leer precio actual ────────────────────────────────
-        yes_tid    = pos.get("yes_token_id")
-        ask, bid   = fetch_yes_clob(yes_tid) if yes_tid else (None, None)
+        # ── PASO B: Precio CLOB actual ────────────────────────────────────────
+        yes_tid  = pos.get("yes_token_id")
+        ask, bid = fetch_yes_clob(yes_tid) if yes_tid else (None, None)
 
         if ask is not None:
             current_yes = ask
@@ -396,16 +382,14 @@ def run_cycle(state):
             current_yes = pos["current_yes"]
             current_no  = pos["current_no"]
 
-        result   = None
-        exit_yes = current_yes
-        pnl      = 0.0
+        result = None
 
-        # ── PASO C: Anti-flasheazo para WON vía CLOB (VAR/goles anulados) ───
+        # ── PASO C: WON vía CLOB YES >= 0.99 (anti-flasheazo VAR) ────────────
         if current_yes >= 0.99:
             pos["won_confirm_count"] = pos.get("won_confirm_count", 0) + 1
             if pos["won_confirm_count"] < WON_CONFIRM_CHECKS:
                 log.info(
-                    "⚠️  GOLAZO/WON candidato (%d/%d) — esperando VAR/confirmación en %ds | %s",
+                    "⚠️  WON candidato (%d/%d) — confirmando en %ds | %s",
                     pos["won_confirm_count"], WON_CONFIRM_CHECKS,
                     WON_CONFIRM_DELAY_S, pos["question"][:55],
                 )
@@ -418,71 +402,45 @@ def run_cycle(state):
                     pos["current_no"]  = current_no
                 if current_yes < 0.99:
                     log.info(
-                        "❌ Falsa alarma / VAR anulado — YES bajó a %.1f%% | %s",
+                        "❌ Falsa alarma VAR — YES bajó a %.1f%% | %s",
                         current_yes * 100, pos["question"][:55],
                     )
                     pos["won_confirm_count"] = 0
             else:
-                result   = "WON"
-                exit_yes = 1.00
-                pnl      = round(pos["tokens_yes"] * 1.0 - pos["allocated"], 4)
+                result = "WON"
         else:
             pos["won_confirm_count"] = 0
 
-        # ── PASO C2: [FIX] Mercado post-partido con YES alto pero sin llegar a 0.99 ──
-        # Cubre mercados Spread/O/U que resuelven lento en el oráculo UMA.
-        # Si el partido ya terminó y YES >= 90%, forzamos re-check Gamma agresivo.
-        if result is None and pos.get("end_date"):
-            try:
-                end_dt = datetime.fromisoformat(pos["end_date"])
-                if now > end_dt and current_yes >= POST_MATCH_YES_THRESHOLD:
-                    log.info(
-                        "🔍 [FIX] Partido terminado + YES=%.1f%% >= %.0f%% — forzando re-check Gamma | %s",
-                        current_yes * 100, POST_MATCH_YES_THRESHOLD * 100, pos["question"][:55],
-                    )
-                    formal2 = check_resolution_gamma(cid)
-                    if formal2 == "WON":
-                        result   = "WON"
-                        exit_yes = 1.00
-                        pnl      = round(pos["tokens_yes"] * 1.0 - pos["allocated"], 4)
-                    elif formal2 == "LOST":
-                        result   = "LOST"
-                        exit_yes = 0.00
-                        pnl      = round(-pos["allocated"], 4)
-                    else:
-                        # Gamma aún no resolvió — registramos en log pero dejamos seguir
-                        log.info(
-                            "⏳ [FIX] Gamma aún no resolvió mercado post-partido | YES=%.1f%% | %s",
-                            current_yes * 100, pos["question"][:55],
-                        )
-            except Exception:
-                pass
-
-        # ── PASO D: LOST vía CLOB (NO llegó a 0.99+, evento descartado) ─────
+        # ── PASO D: LOST vía CLOB NO >= 0.99 ─────────────────────────────────
         if result is None and current_no >= 0.99:
-            result   = "LOST"
-            exit_yes = 0.00
-            pnl      = round(-pos["allocated"], 4)
+            result = "LOST"
 
-        # ── PASO E: EXPIRED ───────────────────────────────────────────────────
-        # [FIX] Reducido de 24h a EXPIRED_GRACE_HOURS (2h) post end_date.
-        # Evita que mercados Spread se queden pegados indefinidamente.
+        # ── PASO E: Partido terminado → resolución binaria ────────────────────
+        # Gamma no resolvió aún pero el end_date ya pasó.
+        # YES >= WIN_THRESHOLD (80%) → WON (el spread/evento claramente se cumplió)
+        # Después de GRACE_HOURS sin resolver y YES < 80% → LOST
+        # Nunca hay EXPIRED: todo cierra como WON o LOST.
         if result is None and pos.get("end_date"):
             try:
                 end_dt = datetime.fromisoformat(pos["end_date"])
-                if now > end_dt + timedelta(hours=EXPIRED_GRACE_HOURS):
-                    result   = "EXPIRED_UNRESOLVED"
-                    exit_yes = current_yes
-                    pnl      = round(pos["tokens_yes"] * exit_yes - pos["allocated"], 4)
-                    log.info(
-                        "⏳ [FIX] EXPIRED tras %dh de gracia | YES=%.1f%% | %s",
-                        EXPIRED_GRACE_HOURS, current_yes * 100, pos["question"][:55],
-                    )
+                if now > end_dt:
+                    if current_yes >= WIN_THRESHOLD:
+                        log.info(
+                            "✅ Post-partido YES=%.1f%% ≥ %.0f%% → WON | %s",
+                            current_yes * 100, WIN_THRESHOLD * 100, pos["question"][:55],
+                        )
+                        result = "WON"
+                    elif now > end_dt + timedelta(hours=GRACE_HOURS):
+                        log.info(
+                            "⏱️  %dh gracia agotadas, YES=%.1f%% → LOST | %s",
+                            GRACE_HOURS, current_yes * 100, pos["question"][:55],
+                        )
+                        result = "LOST"
             except Exception:
                 pass
 
         if result:
-            close_position(cid, pos, result, exit_yes, pnl, state, now)
+            close_position(cid, pos, result, state, now)
             closed_ids.append(cid)
 
     for cid in closed_ids:
@@ -490,8 +448,8 @@ def run_cycle(state):
 
     s = state["stats"]
     log.info(
-        "── Stats: total=%d won=%d lost=%d expired=%d PnL=$%+.4f | Open=%d ──",
-        s["total"], s["won"], s["lost"], s.get("expired", 0), s["pnl"], len(open_pos),
+        "── Stats: total=%d won=%d lost=%d PnL=$%+.4f | Open=%d ──",
+        s["total"], s["won"], s["lost"], s["pnl"], len(open_pos),
     )
 
 
@@ -511,12 +469,11 @@ def print_report():
         print("CSV vacío.")
         return
 
-    total   = len(rows)
-    won     = sum(1 for r in rows if r["result"] == "WON")
-    lost    = sum(1 for r in rows if r["result"] == "LOST")
-    expired = sum(1 for r in rows if r["result"] == "EXPIRED_UNRESOLVED")
-    pnl     = sum(float(r["pnl_usd"]) for r in rows)
-    inv     = sum(float(r["allocated_usd"]) for r in rows)
+    total    = len(rows)
+    won      = sum(1 for r in rows if r["result"] == "WON")
+    lost     = sum(1 for r in rows if r["result"] == "LOST")
+    pnl      = sum(float(r["pnl_usd"]) for r in rows)
+    inv      = sum(float(r["allocated_usd"]) for r in rows)
     won_pnl  = sum(float(r["pnl_usd"]) for r in rows if r["result"] == "WON")
     lost_pnl = sum(float(r["pnl_usd"]) for r in rows if r["result"] == "LOST")
     win_rt   = won / (won + lost) * 100 if (won + lost) > 0 else 0
@@ -527,7 +484,6 @@ def print_report():
     print(f"  Total cerradas            : {total}")
     print(f"  WON (Underdog hit)        : {won}  ({win_rt:.1f}% hit rate)")
     print(f"  LOST (Favorito ganó)      : {lost}")
-    print(f"  EXPIRED sin resolver      : {expired}")
     print(f"  ─────────────────────────────────────────")
     print(f"  PnL WON                   : ${won_pnl:+.4f}")
     print(f"  PnL LOST                  : ${lost_pnl:+.4f}")
@@ -536,14 +492,14 @@ def print_report():
     print(f"  ROI                       : {pnl/inv*100:+.2f}%" if inv > 0 else "  ROI: n/a")
     print(f"{'='*60}")
     print(f"  Nota: WON paga $1/token → PnL = $1/entry_yes - $1")
-    print(f"        Ej: entry YES=4% ($0.04) → paga $1/0.04=$25.00 → +$24.00")
+    print(f"        Ej: entry YES=9% ($0.09) → tokens=11.11 → PnL=+$10.11")
     print(f"{'='*60}\n")
 
-    print(f"{'Resultado':<8} {'YES entry':>9} {'YES exit':>8} {'PnL':>7}  Pregunta")
+    print(f"{'Result':<6} {'YES entry':>9} {'YES exit':>8} {'PnL':>7}  Pregunta")
     print("-" * 75)
     for r in rows[-20:]:
         print(
-            f"{r['result']:<8} {float(r['entry_yes_price'])*100:>8.1f}%"
+            f"{r['result']:<6} {float(r['entry_yes_price'])*100:>8.1f}%"
             f" {float(r['exit_yes_price'])*100:>7.1f}%"
             f" ${float(r['pnl_usd']):>+6.2f}  {r['question'][:45]}"
         )
@@ -572,7 +528,8 @@ def main():
     state = load_state()
 
     log.info("Underdog Hunter Simulator — inicio")
-    log.info("Umbral YES: <%.0f%%  |  Entrada fija: $%.2f", YES_MAX_THRESHOLD * 100, FIXED_ENTRY_USD)
+    log.info("YES umbral: <%.0f%% | Entrada: $%.2f | WIN_THRESHOLD: %.0f%% | Grace: %dh",
+             YES_MAX_THRESHOLD * 100, FIXED_ENTRY_USD, WIN_THRESHOLD * 100, GRACE_HOURS)
 
     if args.loop:
         log.info("Modo loop — intervalo %ds. Ctrl+C para detener.", args.interval)
