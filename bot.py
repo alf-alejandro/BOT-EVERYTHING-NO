@@ -57,13 +57,9 @@ WON_CONFIRM_CHECKS  = 4
 WON_CONFIRM_DELAY_S = 8
 
 SOCCER_KEYWORDS = [
-    " fc ", " sc ", " afc ", " cd ", " cs ", " ca ", " fbpa ",
     "end in a draw",
     "o/u",
-    "spread:",
-    "exact score",
-    "both teams to score",
-    " vs. "
+    "spread:"
 ]
 
 
