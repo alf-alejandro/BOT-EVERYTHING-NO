@@ -10,7 +10,6 @@ import logging
 from pathlib import Path
 from flask import Flask, jsonify
 
-# Importar lógica del bot (Ajustado para el Underdog Hunter)
 from bot import (
     run_cycle, load_state, save_state, init_csv,
     YES_MAX_THRESHOLD, FIXED_ENTRY_USD, CSV_FILE,
@@ -25,7 +24,6 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Estado global compartido entre bot thread y Flask
 shared_state = {"data": None, "lock": threading.Lock()}
 BOT_INTERVAL = int(os.environ.get("BOT_INTERVAL", 300))
 
@@ -51,17 +49,17 @@ def bot_loop():
 
 
 def build_snapshot(state):
-    """Construye un dict serializable para la API."""
     import csv as csv_module
-    from pathlib import Path
 
-    stats = state.get("stats", {})
+    stats    = state.get("stats", {})
     open_pos = state.get("open_positions", {})
 
     open_list = []
     for cid, pos in open_pos.items():
         open_list.append({
             "question":    pos["question"],
+            "yes_side":    pos.get("yes_side", "?"),
+            "no_side":     pos.get("no_side", "?"),
             "entry_yes":   round(pos["entry_yes"] * 100, 1),
             "current_no":  round(pos.get("current_no", pos.get("entry_no", 0)) * 100, 1),
             "current_yes": round(pos.get("current_yes", pos["entry_yes"]) * 100, 1),
@@ -78,18 +76,20 @@ def build_snapshot(state):
             rows = list(csv_module.DictReader(f))
             for r in reversed(rows[-50:]):
                 history.append({
-                    "closed_at":   r["closed_at"],
-                    "question":    r["question"],
-                    "entry_yes":   round(float(r["entry_yes_price"]) * 100, 1),
-                    "exit_yes":    round(float(r["exit_yes_price"]) * 100, 1),
-                    "pnl":         float(r["pnl_usd"]),
-                    "result":      r["result"],
-                    "duration":    r["duration_min"],
+                    "closed_at":  r["closed_at"],
+                    "question":   r["question"],
+                    "yes_side":   r.get("yes_side", "?"),
+                    "no_side":    r.get("no_side", "?"),
+                    "entry_yes":  round(float(r["entry_yes_price"]) * 100, 1),
+                    "exit_yes":   round(float(r["exit_yes_price"]) * 100, 1),
+                    "pnl":        float(r["pnl_usd"]),
+                    "result":     r["result"],
+                    "duration":   r["duration_min"],
                 })
 
-    total = stats.get("total", 0)
-    won   = stats.get("won", 0)
-    lost  = stats.get("lost", 0)
+    total    = stats.get("total", 0)
+    won      = stats.get("won", 0)
+    lost     = stats.get("lost", 0)
     win_rate = round(won / (won + lost) * 100, 1) if (won + lost) > 0 else 0
 
     return {
@@ -133,6 +133,7 @@ DASHBOARD_HTML = """
     --red:       #f85149;
     --yellow:    #e3b341;
     --blue:      #58a6ff;
+    --purple:    #bc8cff;
     --mono:      'Space Mono', monospace;
     --sans:      'Syne', sans-serif;
   }
@@ -148,7 +149,6 @@ DASHBOARD_HTML = """
     overflow-x: hidden;
   }
 
-  /* scanline effect */
   body::before {
     content: '';
     position: fixed;
@@ -288,57 +288,19 @@ DASHBOARD_HTML = """
   .panel-count {
     font-size: 11px;
     color: var(--blue);
-    font-family: var(--mono);
   }
 
   /* ── Open positions ── */
   .open-panel {
     grid-column: 1 / 3;
-    max-height: 360px;
+    max-height: 400px;
     overflow-y: auto;
   }
-  .pos-row {
-    display: grid;
-    grid-template-columns: 1fr 70px 70px 70px;
-    gap: 8px;
-    padding: 10px 18px;
-    border-bottom: 1px solid var(--border);
-    align-items: center;
-    transition: background 0.15s;
-  }
-  .pos-row:hover { background: rgba(255,255,255,0.03); }
-  .pos-row:last-child { border-bottom: none; }
 
-  .pos-question {
-    font-size: 12px;
-    color: var(--text);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .pos-no {
-    text-align: right;
-    font-size: 12px;
-    color: var(--dim); /* Ahora el NO está atenuado */
-  }
-  .pos-yes {
-    text-align: right;
-    font-size: 12px;
-    color: var(--green); /* YES es el foco principal */
-    font-weight: bold;
-  }
-  .pos-vol {
-    text-align: right;
-    font-size: 11px;
-    color: var(--dim);
-  }
-
-  .warning-row { background: rgba(57, 211, 83, 0.1) !important; } /* Verde si hay posible gol */
-  .warning-row .pos-yes { color: #fff; font-weight: bold; }
-
+  /* 5 columnas: pregunta | apuesta | NO% | YES% | Vol */
   .col-header {
     display: grid;
-    grid-template-columns: 1fr 70px 70px 70px;
+    grid-template-columns: 1fr 130px 60px 60px 65px;
     gap: 8px;
     padding: 7px 18px;
     border-bottom: 1px solid var(--border);
@@ -349,16 +311,89 @@ DASHBOARD_HTML = """
   }
   .col-header span:not(:first-child) { text-align: right; }
 
+  .pos-row {
+    display: grid;
+    grid-template-columns: 1fr 130px 60px 60px 65px;
+    gap: 8px;
+    padding: 10px 18px;
+    border-bottom: 1px solid var(--border);
+    align-items: center;
+    transition: background 0.15s;
+  }
+  .pos-row:hover { background: rgba(255,255,255,0.03); }
+  .pos-row:last-child { border-bottom: none; }
+
+  .pos-question {
+    font-size: 11px;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Badge de apuesta: Over, Under, spread, empate */
+  .pos-bet {
+    text-align: right;
+    font-size: 10px;
+    font-weight: bold;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .pos-bet.over   { color: var(--green); }
+  .pos-bet.under  { color: var(--blue); }
+  .pos-bet.spread { color: var(--yellow); }
+  .pos-bet.draw   { color: var(--purple); }
+  .pos-bet.other  { color: var(--dim); }
+
+  .pos-no {
+    text-align: right;
+    font-size: 11px;
+    color: var(--dim);
+  }
+  .pos-yes {
+    text-align: right;
+    font-size: 11px;
+    color: var(--green);
+    font-weight: bold;
+  }
+  .pos-vol {
+    text-align: right;
+    font-size: 11px;
+    color: var(--dim);
+  }
+
+  .warning-row { background: rgba(57, 211, 83, 0.08) !important; }
+  .warning-row .pos-yes { color: #fff; }
+
   /* ── History ── */
   .history-panel {
     grid-column: 3 / 5;
-    max-height: 360px;
+    max-height: 400px;
     overflow-y: auto;
   }
+
+  /* 6 columnas: estado | mercado | apuesta | entry | dur | pnl */
+  .hist-col-header {
+    display: grid;
+    grid-template-columns: 55px 1fr 110px 55px 50px 65px;
+    gap: 6px;
+    padding: 7px 18px;
+    border-bottom: 1px solid var(--border);
+    font-size: 10px;
+    letter-spacing: 1px;
+    color: var(--muted);
+    text-transform: uppercase;
+  }
+  .hist-col-header span:not(:first-child):not(:nth-child(2)):not(:nth-child(3)) {
+    text-align: right;
+  }
+
   .hist-row {
     display: grid;
-    grid-template-columns: 60px 1fr 65px 65px 70px;
-    gap: 8px;
+    grid-template-columns: 55px 1fr 110px 55px 50px 65px;
+    gap: 6px;
     padding: 9px 18px;
     border-bottom: 1px solid var(--border);
     align-items: center;
@@ -368,15 +403,14 @@ DASHBOARD_HTML = """
 
   .badge {
     display: inline-block;
-    padding: 2px 7px;
+    padding: 2px 6px;
     border-radius: 2px;
     font-size: 10px;
     font-weight: bold;
     letter-spacing: 1px;
   }
-  .badge.WON     { background: rgba(57,211,83,0.15);  color: var(--green); }
-  .badge.LOST    { background: rgba(248,81,73,0.15);  color: var(--red); }
-  .badge.EXPIRED { background: rgba(88,166,255,0.15); color: var(--blue); }
+  .badge.WON  { background: rgba(57,211,83,0.15);  color: var(--green); }
+  .badge.LOST { background: rgba(248,81,73,0.15);  color: var(--red); }
 
   .hist-q {
     font-size: 11px;
@@ -385,28 +419,24 @@ DASHBOARD_HTML = """
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .hist-pnl {
-    text-align: right;
-    font-size: 12px;
+  .hist-side {
+    font-size: 10px;
     font-weight: bold;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
+  .hist-side.over   { color: var(--green); }
+  .hist-side.under  { color: var(--blue); }
+  .hist-side.spread { color: var(--yellow); }
+  .hist-side.draw   { color: var(--purple); }
+  .hist-side.other  { color: var(--dim); }
+
+  .hist-entry { text-align: right; font-size: 11px; color: var(--dim); }
+  .hist-dur   { text-align: right; font-size: 11px; color: var(--dim); }
+  .hist-pnl   { text-align: right; font-size: 12px; font-weight: bold; }
   .hist-pnl.pos { color: var(--green); }
   .hist-pnl.neg { color: var(--red); }
-  .hist-no { text-align: right; font-size: 11px; color: var(--green); } /* Ahora muestra YES entry */
-  .hist-dur { text-align: right; font-size: 11px; color: var(--dim); }
-
-  .hist-col-header {
-    display: grid;
-    grid-template-columns: 60px 1fr 65px 65px 70px;
-    gap: 8px;
-    padding: 7px 18px;
-    border-bottom: 1px solid var(--border);
-    font-size: 10px;
-    letter-spacing: 1px;
-    color: var(--muted);
-    text-transform: uppercase;
-  }
-  .hist-col-header span:not(:first-child):not(:nth-child(2)) { text-align: right; }
 
   /* ── Config bar ── */
   .config-bar {
@@ -425,7 +455,27 @@ DASHBOARD_HTML = """
   .config-label { letter-spacing: 1.5px; text-transform: uppercase; }
   .config-val { color: var(--blue); font-weight: bold; }
 
-  /* ── Empty state ── */
+  /* ── Legend ── */
+  .legend {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    margin-left: auto;
+    font-size: 10px;
+  }
+  .legend-item { display: flex; gap: 5px; align-items: center; }
+  .leg-dot { width: 8px; height: 8px; border-radius: 50%; }
+
+  /* ── Chart ── */
+  .chart-panel {
+    grid-column: 1 / 5;
+    height: 160px;
+    overflow: hidden;
+  }
+  .chart-panel .panel-header { margin-bottom: 0; }
+  #pnl-chart { width: 100%; height: 120px; display: block; }
+
+  /* ── Empty / scroll ── */
   .empty {
     padding: 32px;
     text-align: center;
@@ -433,36 +483,15 @@ DASHBOARD_HTML = """
     font-size: 12px;
     letter-spacing: 1px;
   }
-
-  /* ── Scrollbar ── */
   ::-webkit-scrollbar { width: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: var(--muted); border-radius: 2px; }
-
-  /* ── PnL chart ── */
-  .chart-panel {
-    grid-column: 1 / 5;
-    height: 160px;
-    padding: 0;
-    overflow: hidden;
-  }
-  .chart-panel .panel-header { margin-bottom: 0; }
-  #pnl-chart {
-    width: 100%;
-    height: 120px;
-    display: block;
-  }
 
   @keyframes fadeIn {
     from { opacity: 0; transform: translateY(6px); }
     to   { opacity: 1; transform: translateY(0); }
   }
-
-  .last-update {
-    font-size: 10px;
-    color: var(--muted);
-    letter-spacing: 1px;
-  }
+  .last-update { font-size: 10px; color: var(--muted); letter-spacing: 1px; }
 </style>
 </head>
 <body>
@@ -474,10 +503,7 @@ DASHBOARD_HTML = """
   </div>
   <div style="display:flex;align-items:center;gap:20px;">
     <span class="last-update" id="last-update">—</span>
-    <div class="status-pill">
-      <div class="dot"></div>
-      LIVE
-    </div>
+    <div class="status-pill"><div class="dot"></div>LIVE</div>
   </div>
 </header>
 
@@ -504,7 +530,7 @@ DASHBOARD_HTML = """
   <div class="stat-card" style="animation-delay:0.2s">
     <div class="stat-label">Trades Cerrados</div>
     <div class="stat-value" id="s-total2">—</div>
-    <div class="stat-sub" id="s-expired">Expired: —</div>
+    <div class="stat-sub" id="s-expired">WON + LOST: —</div>
   </div>
 
   <div class="panel chart-panel" style="animation-delay:0.25s">
@@ -521,7 +547,8 @@ DASHBOARD_HTML = """
       <span class="panel-count" id="open-count">0</span>
     </div>
     <div class="col-header">
-      <span>Mercado (Fútbol)</span>
+      <span>Mercado</span>
+      <span>Apostando</span>
       <span>NO%</span>
       <span>YES%</span>
       <span>Vol</span>
@@ -537,8 +564,9 @@ DASHBOARD_HTML = """
     <div class="hist-col-header">
       <span>Estado</span>
       <span>Mercado</span>
-      <span>YES entry</span>
-      <span>Duración</span>
+      <span>Apostó</span>
+      <span>Entry</span>
+      <span>Dur</span>
       <span>PnL</span>
     </div>
     <div id="hist-list"><div class="empty">Cargando...</div></div>
@@ -557,36 +585,46 @@ DASHBOARD_HTML = """
       <span class="config-label">Intervalo</span>
       <span class="config-val" id="cfg-interval">—</span>
     </div>
-    <div style="margin-left:auto;font-size:10px;color:var(--muted)">
-      Auto-refresh cada 30s
+    <div class="legend">
+      <div class="legend-item"><div class="leg-dot" style="background:#39d353"></div><span style="color:#6e7681">Over / Spread fav</span></div>
+      <div class="legend-item"><div class="leg-dot" style="background:#58a6ff"></div><span style="color:#6e7681">Under</span></div>
+      <div class="legend-item"><div class="leg-dot" style="background:#e3b341"></div><span style="color:#6e7681">Spread</span></div>
+      <div class="legend-item"><div class="leg-dot" style="background:#bc8cff"></div><span style="color:#6e7681">Empate</span></div>
     </div>
+    <div style="font-size:10px;color:var(--muted)">Auto-refresh 30s</div>
   </div>
 
 </div>
 
 <script>
-let pnlHistory = [];
-let chartCtx = null;
-
-function fmt(n, decimals=2) {
-  return (n >= 0 ? '+' : '') + n.toFixed(decimals);
+function fmt(n, d=2) {
+  return (n >= 0 ? '+' : '') + n.toFixed(d);
 }
-
 function fmtVol(v) {
   if (v >= 1000000) return '$' + (v/1000000).toFixed(1) + 'M';
   if (v >= 1000)    return '$' + (v/1000).toFixed(0) + 'K';
   return '$' + v.toFixed(0);
 }
 
+// Clasifica el texto del side para colorear
+function sideClass(side) {
+  const s = (side || '').toLowerCase();
+  if (s === 'over')                        return 'over';
+  if (s === 'under')                       return 'under';
+  if (s.includes('draw') || s === 'yes')   return 'draw';
+  // Spread: tiene paréntesis con número
+  if (s.includes('(') && (s.includes('+') || s.includes('-'))) return 'spread';
+  return 'other';
+}
+
 function drawChart(history) {
   const canvas = document.getElementById('pnl-chart');
-  const ctx = canvas.getContext('2d');
-  const W = canvas.parentElement.clientWidth;
-  const H = 120;
-  canvas.width = W;
+  const ctx    = canvas.getContext('2d');
+  const W      = canvas.parentElement.clientWidth;
+  const H      = 120;
+  canvas.width  = W;
   canvas.height = H;
 
-  // Build cumulative PnL array from history
   const pts = [...history].reverse().map(h => h.pnl);
   if (pts.length === 0) return;
 
@@ -597,14 +635,13 @@ function drawChart(history) {
   const minV = Math.min(0, ...cum);
   const maxV = Math.max(0, ...cum);
   const range = maxV - minV || 1;
-  const pad = { top: 12, bottom: 12, left: 12, right: 12 };
+  const pad   = { top: 12, bottom: 12, left: 12, right: 12 };
 
   const toX = i => pad.left + (i / (cum.length - 1 || 1)) * (W - pad.left - pad.right);
   const toY = v => pad.top + (1 - (v - minV) / range) * (H - pad.top - pad.bottom);
 
   ctx.clearRect(0, 0, W, H);
 
-  // Zero line
   const zeroY = toY(0);
   ctx.strokeStyle = 'rgba(255,255,255,0.08)';
   ctx.setLineDash([4, 4]);
@@ -615,37 +652,30 @@ function drawChart(history) {
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // Fill
-  const lastVal = cum[cum.length - 1];
+  const lastVal   = cum[cum.length - 1];
   const lineColor = lastVal >= 0 ? '#39d353' : '#f85149';
-  const grad = ctx.createLinearGradient(0, pad.top, 0, H);
-  grad.addColorStop(0, lastVal >= 0 ? 'rgba(57,211,83,0.3)' : 'rgba(248,81,73,0.3)');
+  const grad      = ctx.createLinearGradient(0, pad.top, 0, H);
+  grad.addColorStop(0, lastVal >= 0 ? 'rgba(57,211,83,0.25)' : 'rgba(248,81,73,0.25)');
   grad.addColorStop(1, 'rgba(0,0,0,0)');
 
   ctx.beginPath();
   ctx.moveTo(toX(0), toY(cum[0]));
-  for (let i = 1; i < cum.length; i++) {
-    ctx.lineTo(toX(i), toY(cum[i]));
-  }
+  for (let i = 1; i < cum.length; i++) ctx.lineTo(toX(i), toY(cum[i]));
   ctx.lineTo(toX(cum.length - 1), H);
   ctx.lineTo(toX(0), H);
   ctx.closePath();
   ctx.fillStyle = grad;
   ctx.fill();
 
-  // Line
   ctx.beginPath();
   ctx.moveTo(toX(0), toY(cum[0]));
-  for (let i = 1; i < cum.length; i++) {
-    ctx.lineTo(toX(i), toY(cum[i]));
-  }
+  for (let i = 1; i < cum.length; i++) ctx.lineTo(toX(i), toY(cum[i]));
   ctx.strokeStyle = lineColor;
-  ctx.lineWidth = 2;
+  ctx.lineWidth   = 2;
   ctx.stroke();
 
-  // Last value label
   ctx.fillStyle = lineColor;
-  ctx.font = 'bold 11px Space Mono, monospace';
+  ctx.font      = 'bold 11px Space Mono, monospace';
   ctx.textAlign = 'right';
   ctx.fillText(fmt(lastVal) + ' USD', W - pad.right, pad.top + 10);
 }
@@ -653,42 +683,42 @@ function drawChart(history) {
 async function refresh() {
   try {
     const res = await fetch('/api/state');
-    const d = await res.json();
-    const s = d.stats;
+    const d   = await res.json();
+    const s   = d.stats;
     const cfg = d.config;
 
-    // Stats
-    const pnl = s.pnl;
+    const pnl      = s.pnl;
     const invested = s.total * cfg.entry_usd;
-    const roi = invested > 0 ? (pnl / invested * 100) : 0;
+    const roi      = invested > 0 ? (pnl / invested * 100) : 0;
 
     const pnlEl = document.getElementById('s-pnl');
     pnlEl.textContent = fmt(pnl) + ' USD';
-    pnlEl.className = 'stat-value ' + (pnl >= 0 ? 'pos' : 'neg');
+    pnlEl.className   = 'stat-value ' + (pnl >= 0 ? 'pos' : 'neg');
 
-    document.getElementById('s-roi').textContent = 'ROI: ' + fmt(roi, 1) + '%  |  Capital: $' + invested.toFixed(2);
+    document.getElementById('s-roi').textContent     = 'ROI: ' + fmt(roi, 1) + '%  |  Capital: $' + invested.toFixed(2);
     document.getElementById('s-winrate').textContent = s.win_rate + '%';
-    document.getElementById('s-wl').textContent = 'W: ' + s.won + '  /  L: ' + s.lost;
-    document.getElementById('s-open').textContent = s.open;
-    document.getElementById('s-total').textContent = 'Total cerradas: ' + s.total;
-    document.getElementById('s-total2').textContent = s.total;
-    document.getElementById('s-expired').textContent = 'Expired: ' + s.expired;
+    document.getElementById('s-wl').textContent      = 'W: ' + s.won + '  /  L: ' + s.lost;
+    document.getElementById('s-open').textContent    = s.open;
+    document.getElementById('s-total').textContent   = 'Total cerradas: ' + s.total;
+    document.getElementById('s-total2').textContent  = s.total;
+    document.getElementById('s-expired').textContent = 'WON + LOST: ' + (s.won + s.lost);
 
-    // Config
     document.getElementById('cfg-threshold').textContent = '<' + cfg.threshold + '%';
-    document.getElementById('cfg-entry').textContent = '$' + cfg.entry_usd + ' / op';
-    document.getElementById('cfg-interval').textContent = cfg.interval + 's';
+    document.getElementById('cfg-entry').textContent     = '$' + cfg.entry_usd + ' / op';
+    document.getElementById('cfg-interval').textContent  = cfg.interval + 's';
 
-    // Open positions
+    // ── Posiciones abiertas ──
     const openList = document.getElementById('open-list');
     document.getElementById('open-count').textContent = d.open_positions.length;
     if (d.open_positions.length === 0) {
-      openList.innerHTML = '<div class="empty">Buscando oportunidades en fútbol...</div>';
+      openList.innerHTML = '<div class="empty">Buscando oportunidades...</div>';
     } else {
       openList.innerHTML = d.open_positions.map(p => {
-        const warn = p.current_yes > 80; // Si el YES sube a más de 80%, posible gol
+        const warn = p.current_yes > 80;
+        const sc   = sideClass(p.yes_side);
         return `<div class="pos-row ${warn ? 'warning-row' : ''}">
           <div class="pos-question" title="${p.question}">${p.question}</div>
+          <div class="pos-bet ${sc}" title="Apostando a: ${p.yes_side}">${p.yes_side || '?'}</div>
           <div class="pos-no">${p.current_no}%</div>
           <div class="pos-yes">${p.current_yes}%</div>
           <div class="pos-vol">${fmtVol(p.volume)}</div>
@@ -696,7 +726,7 @@ async function refresh() {
       }).join('');
     }
 
-    // History
+    // ── Historial ──
     const histList = document.getElementById('hist-list');
     document.getElementById('hist-count').textContent = d.history.length;
     if (d.history.length === 0) {
@@ -704,20 +734,19 @@ async function refresh() {
     } else {
       histList.innerHTML = d.history.map(h => {
         const pnlCls = h.pnl >= 0 ? 'pos' : 'neg';
+        const sc     = sideClass(h.yes_side);
         return `<div class="hist-row">
           <span><span class="badge ${h.result}">${h.result.slice(0,3)}</span></span>
           <span class="hist-q" title="${h.question}">${h.question}</span>
-          <span class="hist-no">${h.entry_yes}%</span>
+          <span class="hist-side ${sc}" title="${h.yes_side}">${h.yes_side || '?'}</span>
+          <span class="hist-entry">${h.entry_yes}%</span>
           <span class="hist-dur">${parseFloat(h.duration).toFixed(0)}m</span>
           <span class="hist-pnl ${pnlCls}">${fmt(h.pnl)}</span>
         </div>`;
       }).join('');
     }
 
-    // Chart
     drawChart(d.history);
-
-    // Last update
     document.getElementById('last-update').textContent =
       'UPDATE ' + new Date().toLocaleTimeString('es-CL');
 
@@ -728,12 +757,6 @@ async function refresh() {
 
 refresh();
 setInterval(refresh, 30000);
-window.addEventListener('resize', () => {
-  const d = document.getElementById('hist-list');
-  if (d) {
-    // re-fetch to redraw chart
-  }
-});
 </script>
 </body>
 </html>
@@ -753,7 +776,7 @@ def api_state():
         data = shared_state["data"]
     if data is None:
         state = load_state()
-        data = build_snapshot(state)
+        data  = build_snapshot(state)
     return jsonify(data)
 
 @app.route("/health")
