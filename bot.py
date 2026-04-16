@@ -12,6 +12,8 @@ Lógica de resolución (simplificada, solo WON o LOST):
   Regla: exit siempre es 0.0 o 1.0. Sin EXPIRED.
   PnL WON  = tokens_yes * 1.0 - allocated
   PnL LOST = -allocated
+
+  Mercados aceptados: Over/Under y Empate (Draw). Spreads excluidos.
 """
 
 import csv
@@ -56,11 +58,15 @@ GRACE_HOURS = 2
 WON_CONFIRM_CHECKS  = 4
 WON_CONFIRM_DELAY_S = 8
 
+# Palabras clave para detectar mercados Over/Under y Empate.
+# "spread:" queda EXCLUIDO intencionalmente.
 SOCCER_KEYWORDS = [
     "end in a draw",
     "o/u",
-    "spread:"
 ]
+
+# Outcomes que indican spread y deben ser rechazados explícitamente
+SPREAD_INDICATORS = ["(+", "(-"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -126,15 +132,15 @@ def check_resolution_gamma(cid):
 def parse_outcomes(m):
     """
     Parsea el campo outcomes del mercado y retorna (yes_side, no_side).
-    yes_side = texto exacto del outcome[0] (el token que compra el bot)
-    no_side  = texto exacto del outcome[1]
+    Retorna (None, None) si el mercado es un spread (debe ser descartado).
 
-    Ejemplos reales de Polymarket:
-      outcomes: ["Over", "Under"]           → yes_side="Over",           no_side="Under"
-      outcomes: ["Under", "Over"]           → yes_side="Under",          no_side="Over"
-      outcomes: ["Botafogo FR (-1.5)", "CA Rosario (+1.5)"]
-                                            → yes_side="Botafogo FR (-1.5)", no_side="CA Rosario (+1.5)"
-      outcomes: ["Yes", "No"]              → yes_side="Yes (Draw)",     no_side="No"
+    Mercados aceptados:
+      outcomes: ["Over", "Under"]   → yes_side="Over",        no_side="Under"
+      outcomes: ["Under", "Over"]   → yes_side="Under",       no_side="Over"
+      outcomes: ["Yes", "No"]       → yes_side="Yes (Draw)",  no_side="No"
+
+    Mercados rechazados (spread):
+      outcomes: ["Botafogo FR (-1.5)", "CA Rosario (+1.5)"]  → (None, None)
     """
     raw = m.get("outcomes") or "[]"
     try:
@@ -147,7 +153,32 @@ def parse_outcomes(m):
 
     yes_side = str(outcomes[0]).strip()
     no_side  = str(outcomes[1]).strip()
+
+    # Rechazar spreads: cualquier outcome con paréntesis y signo +/-
+    for indicator in SPREAD_INDICATORS:
+        if indicator in yes_side or indicator in no_side:
+            return None, None
+
     return yes_side, no_side
+
+
+def is_spread_market(m):
+    """
+    Devuelve True si el mercado es un spread y debe ser ignorado.
+    Doble verificación: por keyword en la pregunta y por outcomes.
+    """
+    question = m.get("question", "").lower()
+
+    # Si la pregunta contiene "spread:" es spread (excluido)
+    if "spread:" in question:
+        return True
+
+    # También verificar por outcomes
+    yes_side, no_side = parse_outcomes(m)
+    if yes_side is None:
+        return True
+
+    return False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -188,11 +219,19 @@ def scan_todays_markets():
             question = m.get("question", "")
             q_lower  = question.lower()
 
+            # Solo Over/Under y Draw; spreads excluidos
             if not any(kw in q_lower for kw in SOCCER_KEYWORDS):
                 continue
 
-            # Parsear outcomes para saber exactamente qué lado es cada token
+            # Doble filtro: descartar spreads aunque pasaron el keyword check
+            if is_spread_market(m):
+                log.debug("Spread descartado: %s", question[:60])
+                continue
+
+            # Parsear outcomes
             yes_side, no_side = parse_outcomes(m)
+            if yes_side is None:
+                continue  # spread detectado en outcomes
 
             # outcomePrices[0] corresponde a outcomes[0] = yes_side
             yes_price, no_price = parse_prices(m)
@@ -223,8 +262,8 @@ def scan_todays_markets():
                 "slug":          m.get("slug", ""),
                 "yes_price":     round(yes_price, 4),
                 "no_price":      round(no_price, 4),
-                "yes_side":      yes_side,   # ej: "Over", "Under", "Botafogo FR (-1.5)"
-                "no_side":       no_side,    # ej: "Under", "Over", "CA Rosario (+1.5)"
+                "yes_side":      yes_side,
+                "no_side":       no_side,
                 "volume":        round(volume, 2),
                 "end_date":      end_dt.isoformat() if end_dt else None,
                 "yes_token_id":  yes_token_id,
@@ -237,7 +276,7 @@ def scan_todays_markets():
 
     candidates.sort(key=lambda x: x["yes_price"])
     log.info(
-        "Scan: %d partidos de fútbol | YES %.1f%%–%.1f%% | vol≥$%d",
+        "Scan: %d mercados Over/Under+Draw | YES %.1f%%–%.1f%% | vol≥$%d",
         len(candidates), YES_MIN_THRESHOLD * 100, YES_MAX_THRESHOLD * 100, MIN_VOLUME_USD,
     )
     return candidates
@@ -360,8 +399,8 @@ def run_cycle(state):
             open_pos[c["condition_id"]] = {
                 "question":          c["question"],
                 "slug":              c["slug"],
-                "yes_side":          c["yes_side"],      # lado exacto comprado
-                "no_side":           c["no_side"],       # lado contrario
+                "yes_side":          c["yes_side"],
+                "no_side":           c["no_side"],
                 "entry_no":          c["no_price"],
                 "entry_yes":         c["yes_price"],
                 "current_no":        c["no_price"],
