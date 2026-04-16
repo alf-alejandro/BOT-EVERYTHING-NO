@@ -64,7 +64,7 @@ SOCCER_KEYWORDS = [
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# API helpers
+# Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def now_utc():
@@ -123,6 +123,33 @@ def check_resolution_gamma(cid):
     return None
 
 
+def parse_outcomes(m):
+    """
+    Parsea el campo outcomes del mercado y retorna (yes_side, no_side).
+    yes_side = texto exacto del outcome[0] (el token que compra el bot)
+    no_side  = texto exacto del outcome[1]
+
+    Ejemplos reales de Polymarket:
+      outcomes: ["Over", "Under"]           → yes_side="Over",           no_side="Under"
+      outcomes: ["Under", "Over"]           → yes_side="Under",          no_side="Over"
+      outcomes: ["Botafogo FR (-1.5)", "CA Rosario (+1.5)"]
+                                            → yes_side="Botafogo FR (-1.5)", no_side="CA Rosario (+1.5)"
+      outcomes: ["Yes", "No"]              → yes_side="Yes (Draw)",     no_side="No"
+    """
+    raw = m.get("outcomes") or "[]"
+    try:
+        outcomes = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        outcomes = []
+
+    if not outcomes or len(outcomes) < 2:
+        return "YES", "NO"
+
+    yes_side = str(outcomes[0]).strip()
+    no_side  = str(outcomes[1]).strip()
+    return yes_side, no_side
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Gamma scanner
 # ──────────────────────────────────────────────────────────────────────────────
@@ -164,15 +191,10 @@ def scan_todays_markets():
             if not any(kw in q_lower for kw in SOCCER_KEYWORDS):
                 continue
 
-            outcomes = m.get("outcomes")
-            if isinstance(outcomes, str):
-                try:
-                    outcomes = json.loads(outcomes)
-                except Exception:
-                    outcomes = []
-            if not outcomes or len(outcomes) != 2:
-                continue
+            # Parsear outcomes para saber exactamente qué lado es cada token
+            yes_side, no_side = parse_outcomes(m)
 
+            # outcomePrices[0] corresponde a outcomes[0] = yes_side
             yes_price, no_price = parse_prices(m)
             if yes_price is None or no_price is None:
                 continue
@@ -201,6 +223,8 @@ def scan_todays_markets():
                 "slug":          m.get("slug", ""),
                 "yes_price":     round(yes_price, 4),
                 "no_price":      round(no_price, 4),
+                "yes_side":      yes_side,   # ej: "Over", "Under", "Botafogo FR (-1.5)"
+                "no_side":       no_side,    # ej: "Under", "Over", "CA Rosario (+1.5)"
                 "volume":        round(volume, 2),
                 "end_date":      end_dt.isoformat() if end_dt else None,
                 "yes_token_id":  yes_token_id,
@@ -245,6 +269,7 @@ def save_state(state):
 
 CSV_HEADERS = [
     "closed_at", "condition_id", "question",
+    "yes_side", "no_side",
     "entry_yes_price", "exit_yes_price",
     "allocated_usd", "pnl_usd", "result",
     "volume_at_entry", "end_date", "duration_min",
@@ -281,10 +306,15 @@ def close_position(cid, pos, result, state, now):
     entry_time   = datetime.fromisoformat(pos["entry_time"])
     duration_min = round((now - entry_time).total_seconds() / 60, 1)
 
+    yes_side = pos.get("yes_side", "?")
+    no_side  = pos.get("no_side", "?")
+
     append_csv({
         "closed_at":       now.isoformat(),
         "condition_id":    cid,
         "question":        pos["question"],
+        "yes_side":        yes_side,
+        "no_side":         no_side,
         "entry_yes_price": pos["entry_yes"],
         "exit_yes_price":  exit_yes,
         "allocated_usd":   pos["allocated"],
@@ -299,9 +329,11 @@ def close_position(cid, pos, result, state, now):
     state["stats"]["pnl"]   = round(state["stats"]["pnl"] + pnl, 4)
 
     log.info(
-        "%s %s | exit=%.0f%% PnL=$%+.2f | entry_YES=%.1f%% | %s",
-        emoji, result, exit_yes * 100, pnl,
-        pos["entry_yes"] * 100, pos["question"][:55],
+        "%s %s | Apostó: %s | entry=%.1f%% exit=%.0f%% PnL=$%+.2f | %s",
+        emoji, result,
+        yes_side,
+        pos["entry_yes"] * 100, exit_yes * 100, pnl,
+        pos["question"][:55],
     )
 
 
@@ -328,6 +360,8 @@ def run_cycle(state):
             open_pos[c["condition_id"]] = {
                 "question":          c["question"],
                 "slug":              c["slug"],
+                "yes_side":          c["yes_side"],      # lado exacto comprado
+                "no_side":           c["no_side"],       # lado contrario
                 "entry_no":          c["no_price"],
                 "entry_yes":         c["yes_price"],
                 "current_no":        c["no_price"],
@@ -343,7 +377,8 @@ def run_cycle(state):
             }
             new_entries += 1
             log.info(
-                "ENTRY  YES=%.1f%% (NO=%.1f%%) | vol=$%.0f | %s",
+                "ENTRY  Apostando: [%s] | YES=%.1f%% (NO=%.1f%%) | vol=$%.0f | %s",
+                c["yes_side"],
                 c["yes_price"] * 100, c["no_price"] * 100,
                 c["volume"], c["question"][:60],
             )
@@ -385,9 +420,11 @@ def run_cycle(state):
             pos["won_confirm_count"] = pos.get("won_confirm_count", 0) + 1
             if pos["won_confirm_count"] < WON_CONFIRM_CHECKS:
                 log.info(
-                    "⚠️  WON candidato (%d/%d) — confirmando en %ds | %s",
+                    "⚠️  WON candidato (%d/%d) — confirmando en %ds | [%s] | %s",
                     pos["won_confirm_count"], WON_CONFIRM_CHECKS,
-                    WON_CONFIRM_DELAY_S, pos["question"][:55],
+                    WON_CONFIRM_DELAY_S,
+                    pos.get("yes_side", "?"),
+                    pos["question"][:55],
                 )
                 time.sleep(WON_CONFIRM_DELAY_S)
                 ask2, _ = fetch_yes_clob(yes_tid) if yes_tid else (None, None)
@@ -398,8 +435,10 @@ def run_cycle(state):
                     pos["current_no"]  = current_no
                 if current_yes < 0.99:
                     log.info(
-                        "❌ Falsa alarma VAR — YES bajó a %.1f%% | %s",
-                        current_yes * 100, pos["question"][:55],
+                        "❌ Falsa alarma VAR — YES bajó a %.1f%% | [%s] | %s",
+                        current_yes * 100,
+                        pos.get("yes_side", "?"),
+                        pos["question"][:55],
                     )
                     pos["won_confirm_count"] = 0
             else:
@@ -412,24 +451,24 @@ def run_cycle(state):
             result = "LOST"
 
         # ── PASO E: Partido terminado → resolución binaria ────────────────────
-        # Gamma no resolvió aún pero el end_date ya pasó.
-        # YES >= WIN_THRESHOLD (80%) → WON (el spread/evento claramente se cumplió)
-        # Después de GRACE_HOURS sin resolver y YES < 80% → LOST
-        # Nunca hay EXPIRED: todo cierra como WON o LOST.
         if result is None and pos.get("end_date"):
             try:
                 end_dt = datetime.fromisoformat(pos["end_date"])
                 if now > end_dt:
                     if current_yes >= WIN_THRESHOLD:
                         log.info(
-                            "✅ Post-partido YES=%.1f%% ≥ %.0f%% → WON | %s",
-                            current_yes * 100, WIN_THRESHOLD * 100, pos["question"][:55],
+                            "✅ Post-partido YES=%.1f%% ≥ %.0f%% → WON | [%s] | %s",
+                            current_yes * 100, WIN_THRESHOLD * 100,
+                            pos.get("yes_side", "?"),
+                            pos["question"][:55],
                         )
                         result = "WON"
                     elif now > end_dt + timedelta(hours=GRACE_HOURS):
                         log.info(
-                            "⏱️  %dh gracia agotadas, YES=%.1f%% → LOST | %s",
-                            GRACE_HOURS, current_yes * 100, pos["question"][:55],
+                            "⏱️  %dh gracia agotadas, YES=%.1f%% → LOST | [%s] | %s",
+                            GRACE_HOURS, current_yes * 100,
+                            pos.get("yes_side", "?"),
+                            pos["question"][:55],
                         )
                         result = "LOST"
             except Exception:
@@ -491,13 +530,14 @@ def print_report():
     print(f"        Ej: entry YES=9% ($0.09) → tokens=11.11 → PnL=+$10.11")
     print(f"{'='*60}\n")
 
-    print(f"{'Result':<6} {'YES entry':>9} {'YES exit':>8} {'PnL':>7}  Pregunta")
-    print("-" * 75)
+    print(f"{'Result':<6} {'Apuesta':<28} {'YES%':>6} {'Exit%':>6} {'PnL':>7}  Pregunta")
+    print("-" * 90)
     for r in rows[-20:]:
+        yes_side = r.get("yes_side", "?")
         print(
-            f"{r['result']:<6} {float(r['entry_yes_price'])*100:>8.1f}%"
-            f" {float(r['exit_yes_price'])*100:>7.1f}%"
-            f" ${float(r['pnl_usd']):>+6.2f}  {r['question'][:45]}"
+            f"{r['result']:<6} {yes_side:<28} {float(r['entry_yes_price'])*100:>5.1f}%"
+            f" {float(r['exit_yes_price'])*100:>5.0f}%"
+            f" ${float(r['pnl_usd']):>+6.2f}  {r['question'][:40]}"
         )
 
 
